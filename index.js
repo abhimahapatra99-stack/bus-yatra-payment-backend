@@ -45,13 +45,21 @@ try {
     throw new Error("Firebase service-account required fields are missing.");
   }
 
-  const admin = require("firebase-admin");
+  const { initializeApp, getApps, cert } = require("firebase-admin/app");
+const { getFirestore } = require("firebase-admin/firestore");
 
-  const firebaseCredential = admin.credential.cert({
-    projectId: serviceAccount.project_id,
-    clientEmail: serviceAccount.client_email,
-    privateKey: serviceAccount.private_key.replace(/\\n/g, "\n"),
-  });
+ const firebaseCredential = cert({
+  projectId: serviceAccount.project_id,
+  clientEmail: serviceAccount.client_email,
+  privateKey: serviceAccount.private_key.replace(/\\n/g, "\n"),
+});
+
+const firebaseApp =
+  getApps().length === 0
+    ? initializeApp({ credential: firebaseCredential })
+    : getApps()[0];
+
+db = getFirestore(firebaseApp);
 
   if (admin.apps.length === 0) {
     admin.initializeApp({
