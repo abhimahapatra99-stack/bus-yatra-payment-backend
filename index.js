@@ -5,6 +5,17 @@ const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const fs = require("fs");
 
+const {
+  initializeApp,
+  getApps,
+  cert,
+} = require("firebase-admin/app");
+
+const {
+  getFirestore,
+  FieldValue,
+} = require("firebase-admin/firestore");
+
 require("dotenv").config();
 
 const app = express();
@@ -21,12 +32,13 @@ app.use(express.json({ limit: "100kb" }));
 const firebaseServiceAccountPath =
   "/etc/secrets/firebase-service-account.json";
 
-
 let db = null;
 
 try {
   if (!fs.existsSync(firebaseServiceAccountPath)) {
-    throw new Error("Firebase service-account secret file not found.");
+    throw new Error(
+      "Firebase service-account secret file not found."
+    );
   }
 
   const serviceAccount = JSON.parse(
@@ -42,38 +54,34 @@ try {
     !serviceAccount.client_email ||
     !serviceAccount.private_key
   ) {
-    throw new Error("Firebase service-account required fields are missing.");
+    throw new Error(
+      "Firebase service-account required fields are missing."
+    );
   }
 
-  const { initializeApp, getApps, cert } = require("firebase-admin/app");
-const { getFirestore } = require("firebase-admin/firestore");
+  const firebaseCredential = cert({
+    projectId: serviceAccount.project_id,
+    clientEmail: serviceAccount.client_email,
+    privateKey: serviceAccount.private_key.replace(/\\n/g, "\n"),
+  });
 
- const firebaseCredential = cert({
-  projectId: serviceAccount.project_id,
-  clientEmail: serviceAccount.client_email,
-  privateKey: serviceAccount.private_key.replace(/\\n/g, "\n"),
-});
+  const firebaseApp =
+    getApps().length === 0
+      ? initializeApp({
+          credential: firebaseCredential,
+          projectId: serviceAccount.project_id,
+        })
+      : getApps()[0];
 
-const firebaseApp =
-  getApps().length === 0
-    ? initializeApp({ credential: firebaseCredential })
-    : getApps()[0];
-
-db = getFirestore(firebaseApp);
-
-  if (admin.apps.length === 0) {
-    admin.initializeApp({
-      credential: firebaseCredential,
-      projectId: serviceAccount.project_id,
-    });
-  }
-
-  db = admin.firestore();
+  db = getFirestore(firebaseApp);
 
   console.log("Firebase Admin initialized successfully.");
 } catch (error) {
-  console.error("Firebase initialization failed:", error.message);
-  console.error("Firebase initialization stack:", error.stack);
+  db = null;
+  console.error(
+    "Firebase initialization failed:",
+    error.message
+  );
 }
 
 // ============================================================
@@ -135,10 +143,10 @@ app.get("/", (req, res) => {
 app.get("/razorpay-key", (req, res) => {
   const keyId = process.env.RAZORPAY_KEY_ID;
 
-  if (!keyId) {
-    return res.status(500).json({
+  if (!keyId || !razorpay) {
+    return res.status(503).json({
       success: false,
-      message: "Razorpay Key ID is not configured.",
+      message: "Razorpay is not configured.",
     });
   }
 
@@ -150,8 +158,8 @@ app.get("/razorpay-key", (req, res) => {
 
 // ============================================================
 // CREATE RAZORPAY ORDER
-// Amount is supplied by the current Flutter client.
-// It must later be replaced by a server-calculated fare.
+// NOTE: Amount still comes from Flutter.
+// Server-side fare validation is required before live payments.
 // ============================================================
 
 app.post("/create-order", async (req, res) => {
@@ -164,7 +172,6 @@ app.post("/create-order", async (req, res) => {
     }
 
     const { amount, bookingId } = req.body;
-
     const rupees = Number(amount);
 
     if (
@@ -195,16 +202,12 @@ app.post("/create-order", async (req, res) => {
       });
     }
 
-    const amountPaise = Math.round(rupees * 100);
-    const receipt = bookingId || `BY_${Date.now()}`;
-
     const order = await razorpay.orders.create({
-      amount: amountPaise,
+      amount: Math.round(rupees * 100),
       currency: "INR",
-      receipt,
+      receipt: bookingId || `BY_${Date.now()}`,
     });
 
-    // Save server-created order details for later verification.
     await db.collection("razorpay_orders").doc(order.id).set({
       bookingId: bookingId || null,
       orderId: order.id,
@@ -212,8 +215,7 @@ app.post("/create-order", async (req, res) => {
       currency: order.currency,
       verified: false,
       status: "created",
-      createdAt:
-        require("firebase-admin").firestore.FieldValue.serverTimestamp(),
+      createdAt: FieldValue.serverTimestamp(),
     });
 
     console.log("Razorpay order created:", order.id);
@@ -236,8 +238,6 @@ app.post("/create-order", async (req, res) => {
 
 // ============================================================
 // VERIFY RAZORPAY PAYMENT
-// Check signature, server-stored order, Razorpay order,
-// payment status, amount and currency.
 // ============================================================
 
 app.post("/verify-payment", async (req, res) => {
@@ -273,6 +273,14 @@ app.post("/verify-payment", async (req, res) => {
 
     const secret = process.env.RAZORPAY_KEY_SECRET;
 
+    if (!secret) {
+      return res.status(503).json({
+        success: false,
+        verified: false,
+        message: "Razorpay secret is not configured.",
+      });
+    }
+
     const expectedSignature = crypto
       .createHmac("sha256", secret)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -286,7 +294,6 @@ app.post("/verify-payment", async (req, res) => {
       });
     }
 
-    // The order must exist in our own Firestore record.
     const orderRef = db
       .collection("razorpay_orders")
       .doc(razorpay_order_id);
@@ -303,7 +310,17 @@ app.post("/verify-payment", async (req, res) => {
 
     const savedOrder = orderSnapshot.data();
 
-    // Fetch authoritative order and payment details from Razorpay.
+    if (
+      savedOrder.orderId !== razorpay_order_id ||
+      savedOrder.status !== "created"
+    ) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        message: "Order is invalid or has already been processed.",
+      });
+    }
+
     const [gatewayOrder, payment] = await Promise.all([
       razorpay.orders.fetch(razorpay_order_id),
       razorpay.payments.fetch(razorpay_payment_id),
@@ -334,7 +351,6 @@ app.post("/verify-payment", async (req, res) => {
       });
     }
 
-    // This endpoint accepts only captured payments.
     if (payment.status !== "captured") {
       return res.status(400).json({
         success: false,
@@ -347,11 +363,13 @@ app.post("/verify-payment", async (req, res) => {
       verified: true,
       status: "paid",
       paymentId: razorpay_payment_id,
-      verifiedAt:
-        require("firebase-admin").firestore.FieldValue.serverTimestamp(),
+      verifiedAt: FieldValue.serverTimestamp(),
     });
 
-    console.log("Captured payment verified:", razorpay_payment_id);
+    console.log(
+      "Captured payment verified:",
+      razorpay_payment_id
+    );
 
     return res.status(200).json({
       success: true,
@@ -361,12 +379,16 @@ app.post("/verify-payment", async (req, res) => {
       orderId: razorpay_order_id,
     });
   } catch (error) {
-    console.error("Payment verification failed:", error.message);
+    console.error(
+      "Payment verification failed:",
+      error.message
+    );
 
     return res.status(500).json({
       success: false,
       verified: false,
-      message: "Unable to verify payment. Please contact support if money was deducted.",
+      message:
+        "Unable to verify payment. Contact support if money was deducted.",
     });
   }
 });
