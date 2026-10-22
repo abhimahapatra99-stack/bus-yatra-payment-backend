@@ -57,6 +57,7 @@ try {
   );
 } catch (error) {
   console.error("Firebase initialization failed:", error.message);
+  console.error("Firebase initialization stack:", error.stack);
 }
 
 // ============================================================
