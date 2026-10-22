@@ -21,6 +21,7 @@ app.use(express.json({ limit: "100kb" }));
 const firebaseServiceAccountPath =
   "/etc/secrets/firebase-service-account.json";
 
+
 let db = null;
 
 try {
@@ -34,27 +35,34 @@ try {
 
   if (
     serviceAccount.type !== "service_account" ||
+    typeof serviceAccount.project_id !== "string" ||
+    typeof serviceAccount.client_email !== "string" ||
+    typeof serviceAccount.private_key !== "string" ||
     !serviceAccount.project_id ||
-    !serviceAccount.private_key ||
-    !serviceAccount.client_email
+    !serviceAccount.client_email ||
+    !serviceAccount.private_key
   ) {
-    throw new Error("Firebase service-account file is invalid.");
+    throw new Error("Firebase service-account required fields are missing.");
   }
 
   const admin = require("firebase-admin");
 
+  const firebaseCredential = admin.credential.cert({
+    projectId: serviceAccount.project_id,
+    clientEmail: serviceAccount.client_email,
+    privateKey: serviceAccount.private_key.replace(/\\n/g, "\n"),
+  });
+
   if (admin.apps.length === 0) {
     admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
+      credential: firebaseCredential,
+      projectId: serviceAccount.project_id,
     });
   }
 
   db = admin.firestore();
 
-  console.log(
-    "Firebase Admin initialized for project:",
-    serviceAccount.project_id
-  );
+  console.log("Firebase Admin initialized successfully.");
 } catch (error) {
   console.error("Firebase initialization failed:", error.message);
   console.error("Firebase initialization stack:", error.stack);
