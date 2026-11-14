@@ -178,6 +178,36 @@ function bookingClosed(bus, date, isReturnTrip = false) {
 }
 
 
+// Cancellation refund policy (India local journey time): >24h = 90%, >6h to 24h = 50%, <=6h = 0%.
+function cancellationDeparture(bus, booking, date) {
+  const isReturn = booking.isReturnTrip === true;
+  const direct = booking.departureDateTime || booking.departureAt;
+  if (direct && typeof direct.toDate === "function") return direct.toDate();
+  if (direct) { const d = new Date(direct); if (Number.isFinite(d.getTime())) return d; }
+  const timeValue = isReturn
+    ? (bus?.returnDepartureTime || booking.returnDepartureTime)
+    : (bus?.departureTime || booking.departureTime);
+  let mins = null;
+  if (!isReturn && Number.isInteger(bus?.departureMinutes) && bus.departureMinutes >= 0 && bus.departureMinutes < 1440) {
+    mins = bus.departureMinutes;
+  }
+  if (mins === null) {
+    const m = /^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i.exec(String(timeValue ?? "").trim());
+    if (!m) return null;
+    let h = Number(m[1]); const minute = Number(m[2]); const period = (m[3] || "").toUpperCase();
+    if (period) { if (h < 1 || h > 12) return null; if (h === 12) h = 0; if (period === "PM") h += 12; }
+    if (h > 23 || minute > 59) return null;
+    mins = h * 60 + minute;
+  }
+  return new Date(date.getTime() + mins * 60000);
+}
+function cancellationRefundAmount(paidAmountPaise, departure, now = new Date()) {
+  const hours = (departure.getTime() - now.getTime()) / 3600000;
+  const percentage = hours > 24 ? 90 : (hours > 6 ? 50 : 0);
+  return { percentage, amountPaise: Math.floor(paidAmountPaise * percentage / 100), hoursToDeparture: hours };
+}
+
+
 async function requireFirebaseUser(req, res, next) {
   try {
     if (!auth) return res.status(503).json({ success: false, message: "Firebase authentication is not configured." });
@@ -326,16 +356,53 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     });
     reservationCreated = true;
 
-    const order = await razorpay.orders.create({ amount: totalRupees * 100, currency: "INR", receipt: bookingId });
-    createdGatewayOrder = order;
-    await db.collection("razorpay_orders").doc(order.id).set({
-      orderId: order.id, bookingId, userId: req.firebaseUser.uid, amount: order.amount, currency: "INR", status: "created", verified: false,
-      busId, busName: cleanString(bus.busName || bus.name || "Bus Yatra Bus", 150), from, to, journeyDate: journeyDateString,
-      journeyKey, isReturnTrip, passengerName, mobile, email: cleanString(req.firebaseUser.email || body.email, 200), gender,
-      selectedSeats, fareBySeat, protectedSeatIds, total: totalRupees, busType: cleanString(bus.busType, 100),
-      departureTime: cleanString(bus.departureTime, 50), arrivalTime: cleanString(bus.arrivalTime, 50), holdExpiresAt,
-      createdAt: FieldValue.serverTimestamp(),
-    });
+// Razorpay Orders API has no documented expire_by parameter.
+// The 10-minute seat hold is enforced by Firestore during verification.
+// Important: an order may still be paid after that hold expires;
+// such a captured payment goes to manual reconciliation, never an unverified booking.
+const order = await razorpay.orders.create({
+  amount: totalRupees * 100,
+  currency: "INR",
+  receipt: bookingId,
+  partial_payment: false,
+});
+
+createdGatewayOrder = order;
+
+await db.collection("razorpay_orders").doc(order.id).set({
+  orderId: order.id,
+  bookingId,
+  userId: req.firebaseUser.uid,
+  amount: order.amount,
+  currency: order.currency,
+  status: "created",
+  verified: false,
+
+  busId,
+  busName: cleanString(bus.busName || bus.name || "Bus Yatra Bus", 150),
+  from,
+  to,
+  journeyDate: journeyDateString,
+  journeyKey,
+  isReturnTrip,
+  passengerName,
+  mobile,
+  email: cleanString(req.firebaseUser.email || body.email, 200),
+  gender,
+
+  selectedSeats,
+  fareBySeat,
+  protectedSeatIds,
+  total: totalRupees,
+  busType: cleanString(bus.busType, 100),
+  departureTime: cleanString(bus.departureTime, 50),
+  arrivalTime: cleanString(bus.arrivalTime, 50),
+
+  holdExpiresAt,
+
+  createdAt: FieldValue.serverTimestamp(),
+});
+
     orderRecordSaved = true;
     return res.status(200).json({ success: true, orderId: order.id, amount: order.amount, currency: order.currency, bookingId, total: totalRupees, holdExpiresAt: holdExpiresAt.toDate().toISOString() });
   } catch (error) {
@@ -896,13 +963,17 @@ app.post("/admin/migrate-seat-status", requireFirebaseUser, async (req, res) => 
   }
 });
 
-// Authenticated cancellation: only the booking owner (or an admin) can cancel; seats release atomically.
+// Authenticated cancellation + automatic partial Razorpay refund.
+// A Firestore claim prevents repeat initiation. If the gateway outcome is uncertain,
+// status becomes needs_review and is NEVER retried automatically.
 app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
   try {
     if (!db || !auth) return res.status(503).json({ success: false, message: "Database service is not configured." });
     const bookingId = cleanString((req.body || {}).bookingId, 80);
     if (!bookingId) return res.status(400).json({ success: false, message: "Booking ID is required." });
     const bookingRef = db.collection("bookings").doc(bookingId);
+    const refundRef = db.collection("refunds").doc(`${bookingId}_cancellation`);
+
     const outcome = await db.runTransaction(async (tx) => {
       const bookingSnap = await tx.get(bookingRef);
       if (!bookingSnap.exists) throw new Error("Booking not found.");
@@ -910,27 +981,70 @@ app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
       const userSnap = await tx.get(db.collection("users").doc(req.firebaseUser.uid));
       const isAdmin = userSnap.exists && userSnap.data().role === "admin";
       if (booking.userId !== req.firebaseUser.uid && !isAdmin) throw new Error("You cannot cancel this booking.");
-      if (String(booking.status || "").toLowerCase() === "cancelled") return { alreadyCancelled: true };
+      const refundSnap = await tx.get(refundRef);
+      if (String(booking.status || "").toLowerCase() === "cancelled") {
+        return { alreadyCancelled: true, refundStatus: refundSnap.exists ? refundSnap.data().status : "not_created", refundAmountPaise: refundSnap.exists ? refundSnap.data().refundAmountPaise : 0 };
+      }
       if (String(booking.status || "").toLowerCase() !== "confirmed") throw new Error("Only confirmed bookings can be cancelled.");
+      if (refundSnap.exists) throw new Error("A cancellation/refund request already exists. Please contact support; do not retry.");
+
       const busId = cleanString(booking.busId, 150);
       const dateValue = booking.journeyDate;
       const date = dateValue?.toDate ? dateValue.toDate() : (dateValue instanceof Date ? dateValue : new Date(dateValue));
       if (!busId || !Number.isFinite(date.getTime())) throw new Error("Booking route or date is missing.");
+      const busRef = db.collection("buses").doc(busId);
+      const busSnap = await tx.get(busRef);
+      const bus = busSnap.exists ? busSnap.data() : {};
       const yyyy = /^\d{4}-\d{2}-\d{2}$/.test(String(booking.journeyDateString || ""))
         ? booking.journeyDateString
         : new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
       const journeyKey = journeyKeyFor(busId, yyyy, booking.isReturnTrip === true);
-      const journeySeatsRef = db.collection("journeys").doc(journeyKey).collection("seats");
-      const selected = Array.isArray(booking.selectedSeats) ? booking.selectedSeats.map((x) => cleanString(x,40)).filter(Boolean) : [];
-      const protectedIds = Array.isArray(booking.protectedSeatIds) ? booking.protectedSeatIds.map((x) => cleanString(x,40)).filter(Boolean) : [];
+      const seatCollection = db.collection("journeys").doc(journeyKey).collection("seats");
+      const selected = Array.isArray(booking.selectedSeats) ? booking.selectedSeats.map((x) => cleanString(x, 40)).filter(Boolean) : [];
+      const protectedIds = Array.isArray(booking.protectedSeatIds) ? booking.protectedSeatIds.map((x) => cleanString(x, 40)).filter(Boolean) : [];
       const ids = [...new Set([...selected, ...protectedIds])];
-      const refs = ids.map((id) => journeySeatsRef.doc(id));
-      const snaps = [];
-      for (const ref of refs) snaps.push(await tx.get(ref));
-      tx.update(bookingRef, { status: "cancelled", cancelledAt: FieldValue.serverTimestamp() });
+      const refs = ids.map((id) => seatCollection.doc(id));
+      const seatSnaps = [];
+      for (const ref of refs) seatSnaps.push(await tx.get(ref));
+
+      const paymentId = cleanString(booking.razorpayPaymentId || booking.paymentId, 100);
+      const paidAmount = Number(booking.total ?? booking.amount ?? booking.fare ?? 0);
+      const paidAmountPaise = Number.isFinite(paidAmount) && paidAmount > 0 ? Math.round(paidAmount * 100) : 0;
+      const isRazorpayPaid = String(booking.paymentStatus || "").toLowerCase() === "paid" && paymentId && paidAmountPaise > 0;
+      const departure = cancellationDeparture(bus, booking, date);
+      let refundStatus = "not_applicable";
+      let refundAmountPaise = 0;
+      let refundPercentage = 0;
+      if (isRazorpayPaid && departure) {
+        const calc = cancellationRefundAmount(paidAmountPaise, departure);
+        refundPercentage = calc.percentage;
+        refundAmountPaise = calc.amountPaise;
+        refundStatus = refundAmountPaise > 0 ? "initiating" : "not_eligible";
+      } else if (isRazorpayPaid) {
+        refundStatus = "pending_review";
+      }
+
+      // Preserve the app's existing rule: customers cannot cancel after departure; admin may override.
+      if (!isAdmin && bookingClosed(bus, date, booking.isReturnTrip === true)) throw new Error("Cancellation is closed because the bus has departed or booking is manually closed.");
+
+      tx.update(bookingRef, {
+        status: "cancelled", cancelledAt: FieldValue.serverTimestamp(),
+        refundStatus, refundAmountPaise, refundPercentage,
+      });
+      if (isRazorpayPaid) {
+        tx.create(refundRef, {
+          bookingId, userId: booking.userId, paymentId, paidAmountPaise,
+          refundAmountPaise, refundPercentage, currency: "INR",
+          status: refundStatus, mode: "automatic_with_manual_review_fallback",
+          reason: "booking_cancellation", policyVersion: "cancellation_v1_90_50_0",
+          departureAt: departure ? Timestamp.fromDate(departure) : null,
+          createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp(),
+          note: departure ? (refundAmountPaise > 0 ? "Refund initiation claimed; gateway result pending." : "No refund: cancellation is within 6 hours of departure.") : "Departure time unavailable; manual review required. No gateway request sent.",
+        });
+      }
       refs.forEach((ref, i) => {
-        if (!snaps[i].exists) return;
-        const seat = snaps[i].data();
+        if (!seatSnaps[i].exists) return;
+        const seat = seatSnaps[i].data();
         if (selected.includes(ids[i]) && String(seat.status || "").toLowerCase() === "booked" && seat.bookingId === bookingId) {
           tx.set(ref, { status: "available", bookingId: FieldValue.delete(), bookingType: FieldValue.delete(), customerName: FieldValue.delete(), customerMobile: FieldValue.delete(), gender: FieldValue.delete(), femaleBooked: FieldValue.delete(), paymentMethod: FieldValue.delete(), paymentStatus: FieldValue.delete(), razorpayPaymentId: FieldValue.delete(), journeyDate: FieldValue.delete(), createdAt: FieldValue.delete() }, { merge: true });
           tx.set(publicSeatRef(journeyKey, ids[i]), { seatId: ids[i], status: "available", femaleOnly: FieldValue.delete(), holdExpiresAt: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
@@ -939,10 +1053,46 @@ app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
           tx.set(publicSeatRef(journeyKey, ids[i]), { seatId: ids[i], status: "available", femaleOnly: FieldValue.delete(), holdExpiresAt: FieldValue.delete(), updatedAt: FieldValue.serverTimestamp() }, { merge: true });
         }
       });
-      return { alreadyCancelled: false };
+      return { alreadyCancelled: false, refundStatus, refundAmountPaise, paymentId, refundPercentage };
     });
-    return res.status(200).json({ success: true, alreadyCancelled: outcome.alreadyCancelled === true, message: outcome.alreadyCancelled ? "Booking was already cancelled." : "Booking cancelled and seats released." });
+
+    if (outcome.alreadyCancelled) {
+      return res.status(200).json({ success: true, alreadyCancelled: true, refundStatus: outcome.refundStatus, refundAmountPaise: outcome.refundAmountPaise || 0, message: "Booking was already cancelled. Existing refund status has been preserved; no second refund was sent." });
+    }
+
+    if (outcome.refundStatus === "initiating") {
+      if (!razorpay) {
+        await refundRef.set({ status: "pending_review", note: "Razorpay is not configured; manual review required.", updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+        await bookingRef.set({ refundStatus: "pending_review" }, { merge: true });
+        return res.status(200).json({ success: true, refundStatus: "pending_review", refundAmountPaise: outcome.refundAmountPaise, message: "Booking cancelled. Refund requires manual review because the gateway is unavailable." });
+      }
+      try {
+        const gatewayRefund = await razorpay.payments.refund(outcome.paymentId, {
+          amount: outcome.refundAmountPaise,
+          speed: "normal",
+          notes: { bookingId, reason: "booking_cancellation", policyVersion: "cancellation_v1_90_50_0" },
+        });
+        const gatewayStatus = String(gatewayRefund.status || "").toLowerCase();
+        const mappedStatus = gatewayStatus === "processed" ? "successful" : gatewayStatus === "failed" ? "failed" : "processing";
+        await refundRef.set({ status: mappedStatus, razorpayRefundId: gatewayRefund.id || null, gatewayStatus: gatewayStatus || "unknown", gatewayResponse: { id: gatewayRefund.id || null, status: gatewayStatus || "unknown", amount: gatewayRefund.amount ?? outcome.refundAmountPaise }, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+        await bookingRef.set({ refundStatus: mappedStatus, razorpayRefundId: gatewayRefund.id || null }, { merge: true });
+        return res.status(200).json({ success: true, alreadyCancelled: false, refundStatus: mappedStatus, refundAmountPaise: outcome.refundAmountPaise, refundPercentage: outcome.refundPercentage, razorpayRefundId: gatewayRefund.id || null, message: mappedStatus === "successful" ? "Booking cancelled and refund processed by Razorpay." : "Booking cancelled. Refund request accepted by Razorpay and is being processed." });
+      } catch (gatewayError) {
+        console.error("Razorpay refund initiation failed or outcome is uncertain:", gatewayError.message);
+        await refundRef.set({ status: "needs_review", gatewayError: cleanString(gatewayError.message, 500), updatedAt: FieldValue.serverTimestamp(), note: "Gateway outcome may be uncertain. Automatic retry is disabled to prevent duplicate refunds; reconcile in Razorpay Dashboard." }, { merge: true });
+        await bookingRef.set({ refundStatus: "needs_review" }, { merge: true });
+        return res.status(200).json({ success: true, refundStatus: "needs_review", refundAmountPaise: outcome.refundAmountPaise, message: "Booking cancelled, but refund initiation needs manual verification in Razorpay Dashboard. Do not retry automatically." });
+      }
+    }
+
+    const msg = outcome.refundStatus === "not_eligible"
+      ? "Booking cancelled. No refund is due under the 6-hour cancellation rule."
+      : outcome.refundStatus === "pending_review"
+        ? "Booking cancelled. Departure/payment details need manual refund review."
+        : "Booking cancelled and seats released. No online refund applies to this booking.";
+    return res.status(200).json({ success: true, alreadyCancelled: false, refundStatus: outcome.refundStatus, refundAmountPaise: outcome.refundAmountPaise || 0, refundPercentage: outcome.refundPercentage || 0, message: msg });
   } catch (error) {
+    console.error("Cancellation failed:", error.message);
     const message = error.message || "Unable to cancel booking.";
     const status = /cannot cancel/i.test(message) ? 403 : /not found/i.test(message) ? 404 : 409;
     return res.status(status).json({ success: false, message });
