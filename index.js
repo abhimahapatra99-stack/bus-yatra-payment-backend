@@ -281,7 +281,144 @@ async function requireFirebaseUser(req, res, next) {
   }
 }
 
-app.get("/", (_req, res) => res.json({ success: true, message: "Bus Yatra Payment Backend is running", firebaseConfigured: Boolean(db && auth), razorpayConfigured: Boolean(razorpay) }));
+app.get("/", (_req, res) => res.json({ success: true, message: "Bus Yatra Payment Backend is running", firebaseConfigured: Boolean(db && auth), razorpayConfigured: Boolean(razorpay), ticketVerificationConfigured: Boolean(process.env.TICKET_VERIFY_SECRET && process.env.TICKET_VERIFY_SECRET.length >= 32) }));
+
+// ---------------------------------------------------------------------------
+// BUS YATRA VERIFIED E-TICKET - read-only endpoints.
+// QR tokens are signed server-side; no payment signature or phone is in the QR.
+// Configure TICKET_VERIFY_SECRET (32+ strong random chars) in Render.
+// ---------------------------------------------------------------------------
+const TICKET_VERIFY_SECRET = process.env.TICKET_VERIFY_SECRET || "";
+const TICKET_VERIFY_BASE = (process.env.TICKET_VERIFY_BASE_URL ||
+  "https://bus-yatra-payment-backend-1.onrender.com").replace(/\/+$/, "");
+const ticketServiceReady = () => Boolean(db && auth && TICKET_VERIFY_SECRET.length >= 32);
+const ticketIdValid = (id) => typeof id === "string" && /^[A-Za-z0-9_-]{3,80}$/.test(id);
+function signedTicketToken(bookingId) {
+  return crypto.createHmac("sha256", TICKET_VERIFY_SECRET)
+    .update(`bus-yatra-ticket-v1:${bookingId}`, "utf8")
+    .digest("hex");
+}
+function htmlEscape(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function ticketDate(booking) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(booking.journeyDateString || ""))) {
+    return booking.journeyDateString;
+  }
+  const date = booking.journeyDate?.toDate?.();
+  if (!date) return "Date not available";
+  return new Intl.DateTimeFormat("en-IN", { day: "2-digit", month: "short", year: "numeric", timeZone: "Asia/Kolkata" }).format(date);
+}
+function ticketIsValid(booking) {
+  return booking && String(booking.status || "").toLowerCase() === "confirmed" &&
+    String(booking.paymentStatus || "").toLowerCase() === "paid";
+}
+
+// Customer requests an e-ticket package using their Firebase ID token.
+// Return only the data required to render THEIR confirmed ticket.
+app.post("/ticket-package", requireFirebaseUser, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    if (!ticketServiceReady()) {
+      return res.status(503).json({ success: false, message: "Ticket verification is not configured. Contact support before downloading." });
+    }
+    const bookingId = cleanString(req.body?.bookingId, 80);
+    if (!ticketIdValid(bookingId)) {
+      return res.status(400).json({ success: false, message: "Invalid booking ID." });
+    }
+    const snap = await db.collection("bookings").doc(bookingId).get();
+    // Do not reveal whether another customer's booking exists.
+    if (!snap.exists || snap.data()?.userId !== req.firebaseUser.uid) {
+      return res.status(404).json({ success: false, message: "Ticket not found for this account." });
+    }
+    const b = snap.data();
+    if (!ticketIsValid(b)) {
+      return res.status(409).json({ success: false, message: "Only paid, confirmed bookings have a valid ticket." });
+    }
+    const seatIds = Array.isArray(b.selectedSeats) ? b.selectedSeats.map((x) => String(x)) : [];
+    if (!seatIds.length || !b.busId) {
+      return res.status(409).json({ success: false, message: "Booking seat information is incomplete; contact support." });
+    }
+    let seatLayout = [];
+    try {
+      const seatSnap = await db.collection("buses").doc(String(b.busId)).collection("seats").get();
+      seatLayout = seatSnap.docs.map((seatDoc) => {
+        const s = seatDoc.data();
+        const row = Number(s.row);
+        const position = Number(s.position);
+        if (!Number.isInteger(row) || !Number.isInteger(position) || row < 0 || position < 0 || row > 40 || position > 3 ||
+          s.row === undefined || s.position === undefined) return null;
+        return {
+          seatId: String(s.seatId || seatDoc.id),
+          deck: String(s.deck || "lower").toLowerCase() === "upper" ? "upper" : "lower",
+          type: String(s.seatType || "seater"), row, position,
+        };
+      }).filter(Boolean);
+    } catch (layoutError) {
+      console.error("Ticket layout unavailable:", layoutError.message);
+      // A ticket remains downloadable even if the seat layout cannot load.
+    }
+    const verifyUrl = `${TICKET_VERIFY_BASE}/ticket-verify?id=${encodeURIComponent(bookingId)}&token=${signedTicketToken(bookingId)}`;
+    return res.json({
+      success: true,
+      verifyUrl,
+      ticket: {
+        bookingId,
+        busName: String(b.busName || ""), busType: String(b.busType || ""),
+        from: String(b.from || ""), to: String(b.to || ""),
+        date: ticketDate(b),
+        departureTime: String(b.departureTime || ""), arrivalTime: String(b.arrivalTime || ""),
+        passengerName: String(b.passengerName || ""),
+        gender: String(b.gender || ""),
+        mobile: String(b.mobile || ""),
+        email: String(b.email || ""),
+        seats: seatIds,
+        total: Number(b.total) || 0,
+        paymentMethod: String(b.paymentMethod || ""),
+        status: "confirmed", paymentStatus: "paid",
+      },
+      seatLayout,
+    });
+  } catch (error) {
+    console.error("Ticket package error:", error.message);
+    return res.status(500).json({ success: false, message: "Ticket could not be prepared. Please retry." });
+  }
+});
+
+// The QR is a signed public URL. Always check Firestore LIVE: a cancellation
+// immediately invalidates the old printed QR. No personal phone/email displayed.
+app.get("/ticket-verify", async (req, res) => {
+  res.set({ "Cache-Control": "no-store, max-age=0", "X-Robots-Tag": "noindex, nofollow", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'" });
+  const page = (title, message, color, details = "") => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Bus Yatra Ticket Verification</title><style>body{margin:0;background:#fff3f3;font-family:Arial,sans-serif;color:#232323;padding:28px}.panel{max-width:520px;margin:30px auto;background:white;border-radius:20px;box-shadow:0 8px 25px #0001;padding:24px}.brand{background:#ba0d1e;color:white;padding:18px;border-radius:13px;font-size:25px;font-weight:800}h1{font-size:24px;color:${color}}p{line-height:1.6}dl{display:grid;grid-template-columns:120px 1fr;gap:12px}dt{color:#666}dd{margin:0;font-weight:bold}.note{color:#666;font-size:12px}</style></head><body><main class="panel"><div class="brand">BUS YATRA</div><h1>${htmlEscape(title)}</h1><p>${htmlEscape(message)}</p>${details}<p class="note">Live verification from Bus Yatra. Always compare booking details with the passenger's ticket.</p></main></body></html>`;
+  try {
+    if (!ticketServiceReady()) return res.status(503).send(page("Verification unavailable", "Ticket verification is temporarily unavailable.", "#b45309"));
+    const id = cleanString(req.query.id, 80);
+    const token = cleanString(req.query.token, 100);
+    if (!ticketIdValid(id) || !safeEqualHex(signedTicketToken(id), token)) {
+      return res.status(400).send(page("INVALID TICKET", "The ticket QR is invalid or has been modified.", "#b91c1c"));
+    }
+    const snap = await db.collection("bookings").doc(id).get();
+    if (!snap.exists) return res.status(404).send(page("INVALID TICKET", "Booking does not exist.", "#b91c1c"));
+    const b = snap.data();
+    const valid = ticketIsValid(b);
+    const detailRows = [
+      ["Booking ID", id],
+      ["Bus", b.busName],
+      ["Route", `${b.from || ""} to ${b.to || ""}`],
+      ["Journey", ticketDate(b)],
+      ["Seats", Array.isArray(b.selectedSeats) ? b.selectedSeats.join(", ") : "N/A"],
+      ["Booking", String(b.status || "unknown").toUpperCase()],
+      ["Payment", String(b.paymentStatus || "unknown").toUpperCase()],
+    ];
+    const details = `<dl>${detailRows.map(([label, value]) => `<dt>${htmlEscape(label)}</dt><dd>${htmlEscape(value)}</dd>`).join("")}</dl>`;
+    return res.status(200).send(page(valid ? "VALID TICKET" : "NOT VALID FOR BOARDING", valid ? "Confirmed booking and paid payment verified." : "This booking is no longer confirmed and paid. Do not board using this ticket.", valid ? "#15803d" : "#b91c1c", details));
+  } catch (error) {
+    console.error("Ticket verify error:", error.message);
+    return res.status(503).send(page("Verification unavailable", "Could not check current booking status. Please retry.", "#b45309"));
+  }
+});
+
 app.get("/razorpay-key", (_req, res) => {
   if (!razorpay || !process.env.RAZORPAY_KEY_ID) return res.status(503).json({ success: false, message: "Razorpay is not configured." });
   return res.json({ success: true, keyId: process.env.RAZORPAY_KEY_ID });
