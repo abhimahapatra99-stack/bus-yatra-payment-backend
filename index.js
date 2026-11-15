@@ -11,6 +11,66 @@ require("dotenv").config();
 
 const app = express();
 app.use(cors());
+
+// The webhook needs the EXACT raw payload to verify Razorpay's signature.
+// Register before express.json(). Set RAZORPAY_WEBHOOK_SECRET in Render and
+// configure /razorpay-webhook in the Razorpay Dashboard separately.
+app.post("/razorpay-webhook", express.raw({ type: "application/json", limit: "100kb" }), async (req, res) => {
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret || !dependenciesReady()) {
+      return res.status(503).json({ success: false, message: "Webhook is not configured." });
+    }
+    if (!Buffer.isBuffer(req.body)) {
+      return res.status(400).json({ success: false, message: "Invalid webhook payload." });
+    }
+    const expected = crypto.createHmac("sha256", webhookSecret).update(req.body).digest("hex");
+    const signature = req.headers["x-razorpay-signature"];
+    if (!safeEqualHex(expected, signature)) {
+      return res.status(400).json({ success: false, message: "Invalid webhook signature." });
+    }
+    const event = JSON.parse(req.body.toString("utf8"));
+    if (!event || !["payment.captured", "order.paid"].includes(event.event)) {
+      return res.json({ success: true, ignored: true });
+    }
+    const orderId = cleanString(
+      event.event === "payment.captured"
+        ? event.payload?.payment?.entity?.order_id
+        : event.payload?.order?.entity?.id, 100
+    );
+    if (!orderId) return res.status(400).json({ success: false, message: "Missing order ID." });
+
+    const snap = await db.collection("razorpay_orders").doc(orderId).get();
+    // This Razorpay account may serve unrelated products. Only reconcile
+    // orders created by Bus Yatra and owned by a known Firebase user.
+    if (!snap.exists || !snap.data()?.userId) {
+      return res.json({ success: true, ignored: true });
+    }
+    const ownedUserId = snap.data().userId;
+    const internalReq = { firebaseUser: { uid: ownedUserId }, body: { orderId } };
+    let outcomeStatus = 500;
+    let outcome = null;
+    const internalRes = {
+      status(code) { outcomeStatus = code; return this; },
+      json(body) { outcome = body; return this; },
+    };
+    await verifyCapturedPaymentAndBook(internalReq, internalRes, true);
+    if (outcomeStatus === 200 && outcome?.bookingSaved === true) {
+      return res.json({ success: true, bookingConfirmed: true });
+    }
+    if (outcomeStatus === 202 && outcome?.paymentReview === true) {
+      // Review record was persisted; do not deliver a double booking.
+      console.error("Webhook captured payment needs review:", orderId);
+      return res.json({ success: true, paymentReview: true });
+    }
+    // Gateway may not yet show the captured payment; let Razorpay retry.
+    return res.status(503).json({ success: false, message: "Payment reconciliation not complete." });
+  } catch (error) {
+    console.error("Razorpay webhook processing error:", error.message);
+    return res.status(503).json({ success: false, message: "Webhook could not be processed." });
+  }
+});
+
 app.use(express.json({ limit: "100kb" }));
 
 const firebaseServiceAccountPath =
@@ -457,7 +517,11 @@ await db.collection("razorpay_orders").doc(order.id).set({
 
 // Verify gateway signature/captured payment, then create booking and update seats atomically on the server.
 
-app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
+// Used by both the Checkout success callback and recovery of a missing
+// callback after an in-Checkout retry, network interruption or dismissal.
+// Recovery authenticates the booking owner and reads the payment from Razorpay;
+// it does not trust a client-provided payment ID or payment status.
+async function verifyCapturedPaymentAndBook(req, res, reconciliation = false) {
   let orderId = "";
   let paymentId = "";
   let savedOrder = null;
@@ -474,9 +538,61 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
     }
 
     const body = req.body || {};
-    orderId = cleanString(body.razorpay_order_id, 100);
+    orderId = cleanString(reconciliation ? body.orderId : body.razorpay_order_id, 100);
     paymentId = cleanString(body.razorpay_payment_id, 100);
-    const signature = cleanString(body.razorpay_signature, 200);
+    let signature = cleanString(body.razorpay_signature, 200);
+
+    if (reconciliation) {
+      if (!orderId) {
+        return res.status(400).json({ success: false, message: "Order ID is required." });
+      }
+      const recoveryOrderSnap = await db.collection("razorpay_orders").doc(orderId).get();
+      if (!recoveryOrderSnap.exists) {
+        return res.status(404).json({ success: false, message: "Payment order not found." });
+      }
+      const recoveryOrder = recoveryOrderSnap.data();
+      if (recoveryOrder.userId !== req.firebaseUser.uid) {
+        return res.status(403).json({ success: false, message: "This payment belongs to another account." });
+      }
+
+      // Always check the gateway, including when the user's web callback was
+      // lost or the order is already marked paid in Firestore.
+      const [gatewayOrder, attempts] = await Promise.all([
+        razorpay.orders.fetch(orderId),
+        razorpay.orders.fetchPayments(orderId),
+      ]);
+      const payments = Array.isArray(attempts?.items) ? attempts.items : [];
+      const captured = payments.filter((p) =>
+        p && p.order_id === orderId && p.status === "captured" &&
+        p.amount === recoveryOrder.amount && p.currency === "INR"
+      );
+      if (captured.length > 1) {
+        return res.status(202).json({ success: false, paymentReview: true,
+          bookingSaved: false, orderId,
+          message: "Multiple captured payments need manual reconciliation. Do not pay again." });
+      }
+      if (captured.length === 0) {
+        // Fail closed if the gateway thinks this order is paid but does not
+        // return a matching captured payment, or authorization is pending.
+        const hasAuthorized = payments.some((p) => p && p.order_id === orderId && p.status === "authorized");
+        if (hasAuthorized || gatewayOrder.status === "paid" || recoveryOrder.status === "paid" || recoveryOrder.paymentCaptured === true) {
+          return res.status(202).json({ success: false, paymentReview: true,
+            bookingSaved: false, orderId,
+            message: "Payment is processing or needs review. Do not pay again; check its status shortly." });
+        }
+        const mayRetry = recoveryOrder.status === "created" && holdIsActive(recoveryOrder);
+        return res.status(200).json({ success: false, status: "unpaid", bookingSaved: false,
+          paymentCaptured: false, mayRetry, orderId, amount: recoveryOrder.amount,
+          message: mayRetry
+            ? "No captured payment found yet. You can retry safely using the same Razorpay order."
+            : "No captured payment found and the seat hold has expired. Select seats again after checking payment status." });
+      }
+      paymentId = cleanString(captured[0].id, 100);
+      // An authenticated recovery uses the payment ID obtained directly from
+      // Razorpay, so the normal verification path can be safely reused.
+      signature = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+        .update(`${orderId}|${paymentId}`).digest("hex");
+    }
 
     if (!orderId || !paymentId || !signature) {
       return res.status(400).json({
@@ -678,7 +794,9 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
         pairJourneySnaps[id] = await tx.get(journeySeatsRef.doc(id));
       }
 
-      // Validate every selected seat and its unexpired hold.
+      // A captured payment may arrive after hold expiry. Confirm only when
+      // the seat is STILL reserved by this exact order/user and has not been
+      // reclaimed. Expiry alone is not a reason to reject a paid customer.
       for (const id of seatIds) {
         const busSeatSnap = selectedBusSnaps[id];
         const journeySnap = selectedJourneySnaps[id];
@@ -694,7 +812,6 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
           String(journey.status || "").toLowerCase() !== "pendingpayment" ||
           journey.holdBookingId !== savedOrder.bookingId ||
           journey.holdUserId !== savedOrder.userId ||
-          !holdIsActive(journey) ||
           seat.blocked === true ||
           String(seat.status || "").toLowerCase() === "blocked"
         ) {
@@ -729,8 +846,7 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
           pair.femaleOnly !== true ||
           pair.protectedByBookingId !== savedOrder.bookingId ||
           pair.holdBookingId !== savedOrder.bookingId ||
-          pair.holdUserId !== savedOrder.userId ||
-          !holdIsActive(pair)
+          pair.holdUserId !== savedOrder.userId
         ) {
           throw new Error(`Protected paired seat ${id} reservation is expired or changed.`);
         }
@@ -900,7 +1016,12 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
       message: error.message || "Unable to verify payment.",
     });
   }
-});
+}
+
+app.post("/verify-payment", requireFirebaseUser, (req, res) =>
+  verifyCapturedPaymentAndBook(req, res, false));
+app.post("/reconcile-payment", requireFirebaseUser, (req, res) =>
+  verifyCapturedPaymentAndBook(req, res, true));
 
 // One-time admin migration: copy only safe availability fields from legacy journey seats.
 app.post("/admin/migrate-seat-status", requireFirebaseUser, async (req, res) => {
