@@ -268,6 +268,53 @@ function cancellationRefundAmount(paidAmountPaise, departure, now = new Date()) 
 }
 
 
+// Shared quote logic for the pre-cancellation screen and actual cancellation.
+// The actual cancellation always recalculates this server-side.
+function cancellationQuoteFor(booking, bus, journeyDate) {
+  const paymentId = cleanString(booking.razorpayPaymentId || booking.paymentId, 100);
+  const paidAmount = Number(booking.total ?? booking.amount ?? booking.fare ?? 0);
+  const paidAmountPaise = Number.isFinite(paidAmount) && paidAmount > 0
+    ? Math.round(paidAmount * 100) : 0;
+  const method = String(booking.paymentMethod || "").trim().toLowerCase();
+  const paid = String(booking.paymentStatus || "").trim().toLowerCase() === "paid";
+  const onlinePaid = paid && (method === "razorpay" || Boolean(booking.razorpayOrderId));
+  const departure = cancellationDeparture(bus, booking, journeyDate);
+
+  let refundStatus = "not_applicable";
+  let refundPercentage = 0;
+  let refundAmountPaise = 0;
+  if (onlinePaid) {
+    if (!departure || paidAmountPaise <= 0) {
+      // Never silently classify a paid Razorpay booking as non-refundable
+      // merely because a field needed to automate the refund is missing.
+      refundStatus = "needs_review";
+    } else {
+      const calc = cancellationRefundAmount(paidAmountPaise, departure);
+      refundPercentage = calc.percentage;
+      refundAmountPaise = calc.amountPaise;
+      if (refundAmountPaise <= 0) refundStatus = "not_eligible";
+      else refundStatus = paymentId ? "initiating" : "needs_review";
+    }
+  }
+  return { paymentId, paidAmountPaise, onlinePaid, departure,
+    refundStatus, refundPercentage, refundAmountPaise };
+}
+
+function cancellationStatusMessage(status) {
+  switch (status) {
+    case "successful": return "Razorpay marked the refund processed. The bank may take additional time to reflect the credit.";
+    case "processing": return "Refund request accepted by Razorpay and is processing; the money is not yet confirmed credited.";
+    case "initiating": return "Refund initiation is underway. Refresh the status shortly.";
+    case "needs_review":
+    case "pending_review":
+    case "failed": return "Booking cancelled, but refund needs manual verification in Razorpay Dashboard. Contact support. Do not repeat the refund request.";
+    case "not_eligible": return "Booking cancelled. The policy gives no refund within 6 hours of departure.";
+    case "not_applicable": return "Booking cancelled. An automatic Razorpay refund is not applicable to this payment method.";
+    default: return "Refund status is not yet confirmed; please check again or contact support.";
+  }
+}
+
+
 async function requireFirebaseUser(req, res, next) {
   try {
     if (!auth) return res.status(503).json({ success: false, message: "Firebase authentication is not configured." });
@@ -1221,6 +1268,54 @@ app.post("/admin/migrate-seat-status", requireFirebaseUser, async (req, res) => 
   }
 });
 
+// Returns an estimate only. It neither cancels a booking nor starts a refund.
+app.post("/cancellation-quote", requireFirebaseUser, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    if (!db || !auth) return res.status(503).json({ success: false, message: "Database unavailable." });
+    const bookingId = cleanString(req.body?.bookingId, 80);
+    if (!bookingId) return res.status(400).json({ success: false, message: "Booking ID required." });
+    const snap = await db.collection("bookings").doc(bookingId).get();
+    if (!snap.exists) return res.status(404).json({ success: false, message: "Booking not found." });
+    const booking = snap.data();
+    const userSnap = await db.collection("users").doc(req.firebaseUser.uid).get();
+    const isAdmin = userSnap.exists && userSnap.data()?.role === "admin";
+    if (booking.userId !== req.firebaseUser.uid && !isAdmin) {
+      return res.status(403).json({ success: false, message: "Cannot access this booking." });
+    }
+    if (String(booking.status || "").toLowerCase() !== "confirmed") {
+      return res.status(409).json({ success: false, message: "Only confirmed bookings can be cancelled." });
+    }
+    const busId = cleanString(booking.busId, 150);
+    const dateRaw = booking.journeyDate;
+    const date = dateRaw?.toDate ? dateRaw.toDate() : new Date(dateRaw);
+    if (!busId || !Number.isFinite(date.getTime())) {
+      return res.status(409).json({ success: false, message: "Journey details are incomplete. Contact support." });
+    }
+    const busSnap = await db.collection("buses").doc(busId).get();
+    const bus = busSnap.exists ? busSnap.data() : {};
+    if (!isAdmin && bookingClosed(bus, date, booking.isReturnTrip === true)) {
+      return res.status(403).json({ success: false, message: "Cancellation is closed for this journey." });
+    }
+    const quote = cancellationQuoteFor(booking, bus, date);
+    return res.status(200).json({
+      success: true, bookingId,
+      refundStatus: quote.refundStatus,
+      refundAmountPaise: quote.refundAmountPaise,
+      refundPercentage: quote.refundPercentage,
+      paymentMethod: quote.onlinePaid ? "Razorpay" : String(booking.paymentMethod || "Other"),
+      warning: quote.refundStatus === "needs_review"
+        ? "Payment/refund fields are incomplete. Cancellation will require manual refund review."
+        : quote.refundStatus === "not_eligible"
+          ? "No refund is due within 6 hours of departure."
+          : "Refund is an estimate. Final eligibility is recalculated when you confirm. Razorpay processing is separate from booking cancellation.",
+    });
+  } catch (error) {
+    console.error("Cancellation quote failed:", error.message);
+    return res.status(500).json({ success: false, message: "Unable to calculate refund estimate. Contact support before cancellation." });
+  }
+});
+
 // Authenticated cancellation + automatic partial Razorpay refund.
 // A Firestore claim prevents repeat initiation. If the gateway outcome is uncertain,
 // status becomes needs_review and is NEVER retried automatically.
@@ -1265,22 +1360,9 @@ app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
       const seatSnaps = [];
       for (const ref of refs) seatSnaps.push(await tx.get(ref));
 
-      const paymentId = cleanString(booking.razorpayPaymentId || booking.paymentId, 100);
-      const paidAmount = Number(booking.total ?? booking.amount ?? booking.fare ?? 0);
-      const paidAmountPaise = Number.isFinite(paidAmount) && paidAmount > 0 ? Math.round(paidAmount * 100) : 0;
-      const isRazorpayPaid = String(booking.paymentStatus || "").toLowerCase() === "paid" && paymentId && paidAmountPaise > 0;
-      const departure = cancellationDeparture(bus, booking, date);
-      let refundStatus = "not_applicable";
-      let refundAmountPaise = 0;
-      let refundPercentage = 0;
-      if (isRazorpayPaid && departure) {
-        const calc = cancellationRefundAmount(paidAmountPaise, departure);
-        refundPercentage = calc.percentage;
-        refundAmountPaise = calc.amountPaise;
-        refundStatus = refundAmountPaise > 0 ? "initiating" : "not_eligible";
-      } else if (isRazorpayPaid) {
-        refundStatus = "pending_review";
-      }
+      const quote = cancellationQuoteFor(booking, bus, date);
+      const { paymentId, paidAmountPaise, onlinePaid, departure,
+        refundStatus, refundAmountPaise, refundPercentage } = quote;
 
       // Preserve the app's existing rule: customers cannot cancel after departure; admin may override.
       if (!isAdmin && bookingClosed(bus, date, booking.isReturnTrip === true)) throw new Error("Cancellation is closed because the bus has departed or booking is manually closed.");
@@ -1289,7 +1371,7 @@ app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
         status: "cancelled", cancelledAt: FieldValue.serverTimestamp(),
         refundStatus, refundAmountPaise, refundPercentage,
       });
-      if (isRazorpayPaid) {
+      if (onlinePaid) {
         tx.create(refundRef, {
           bookingId, userId: booking.userId, paymentId, paidAmountPaise,
           refundAmountPaise, refundPercentage, currency: "INR",
@@ -1343,17 +1425,86 @@ app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
       }
     }
 
-    const msg = outcome.refundStatus === "not_eligible"
-      ? "Booking cancelled. No refund is due under the 6-hour cancellation rule."
-      : outcome.refundStatus === "pending_review"
-        ? "Booking cancelled. Departure/payment details need manual refund review."
-        : "Booking cancelled and seats released. No online refund applies to this booking.";
+    const msg = cancellationStatusMessage(outcome.refundStatus);
     return res.status(200).json({ success: true, alreadyCancelled: false, refundStatus: outcome.refundStatus, refundAmountPaise: outcome.refundAmountPaise || 0, refundPercentage: outcome.refundPercentage || 0, message: msg });
   } catch (error) {
     console.error("Cancellation failed:", error.message);
     const message = error.message || "Unable to cancel booking.";
     const status = /cannot cancel/i.test(message) ? 403 : /not found/i.test(message) ? 404 : 409;
     return res.status(status).json({ success: false, message });
+  }
+});
+
+
+// Read-only reconciliation: safely refresh status of an existing Razorpay refund.
+// NEVER creates/retries a refund, preventing duplicate credits after timeouts.
+app.post("/refund-status", requireFirebaseUser, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    if (!db || !auth) return res.status(503).json({ success: false, message: "Database unavailable." });
+    const bookingId = cleanString(req.body?.bookingId, 80);
+    if (!bookingId) return res.status(400).json({ success: false, message: "Booking ID required." });
+    const bookingRef = db.collection("bookings").doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+    if (!bookingSnap.exists) return res.status(404).json({ success: false, message: "Booking not found." });
+    const booking = bookingSnap.data();
+    const userSnap = await db.collection("users").doc(req.firebaseUser.uid).get();
+    const isAdmin = userSnap.exists && userSnap.data()?.role === "admin";
+    if (booking.userId !== req.firebaseUser.uid && !isAdmin) {
+      return res.status(403).json({ success: false, message: "Cannot access this booking." });
+    }
+    if (String(booking.status || "").toLowerCase() !== "cancelled") {
+      return res.status(409).json({ success: false, message: "Booking is not cancelled." });
+    }
+    const refundRef = db.collection("refunds").doc(`${bookingId}_cancellation`);
+    const refundSnap = await refundRef.get();
+    const refund = refundSnap.exists ? refundSnap.data() : null;
+    let status = String(refund?.status || booking.refundStatus || "not_created");
+    const amountPaise = Math.max(0, Number(refund?.refundAmountPaise ?? booking.refundAmountPaise ?? 0) || 0);
+    const refundId = cleanString(refund?.razorpayRefundId || booking.razorpayRefundId, 120);
+    const paymentMethod = String(booking.paymentMethod || "").toLowerCase();
+    const hadRazorpayPayment = String(booking.paymentStatus || "").toLowerCase() === "paid" &&
+      (paymentMethod === "razorpay" || Boolean(booking.razorpayOrderId));
+    if (!refund && hadRazorpayPayment && ["not_created", "not_applicable"].includes(status)) {
+      // Older app versions may have cancelled an online booking without a
+      // refund record. Never silently report such a case as no refund due.
+      // A human must check the actual cancellation time and gateway refunds.
+      status = "needs_review";
+      await bookingRef.set({ refundStatus: "needs_review" }, { merge: true });
+    }
+
+    if (razorpay && refundId) {
+      try {
+        const gateway = await razorpay.refunds.fetch(refundId);
+        const gatewayPaymentId = cleanString(gateway?.payment_id, 120);
+        const recordedPaymentId = cleanString(refund?.paymentId || booking.razorpayPaymentId || booking.paymentId, 120);
+        const gatewayAmount = Number(gateway?.amount);
+        // Do not accept data from a different payment or an unexpected refund amount.
+        if (gateway?.id !== refundId || (recordedPaymentId && gatewayPaymentId !== recordedPaymentId)
+            || !Number.isFinite(gatewayAmount) || gatewayAmount !== amountPaise) {
+          status = "needs_review";
+        } else {
+          const gatewayStatus = String(gateway?.status || "").toLowerCase();
+          status = gatewayStatus === "processed" ? "successful"
+            : gatewayStatus === "failed" ? "failed"
+            : ["pending", "created"].includes(gatewayStatus) ? "processing" : "needs_review";
+        }
+        if (refund) {
+          await refundRef.set({ status, checkedAt: FieldValue.serverTimestamp() }, { merge: true });
+        }
+        await bookingRef.set({ refundStatus: status }, { merge: true });
+      } catch (error) {
+        console.error("Refund status gateway lookup failed:", error.message);
+        // Preserve last known state; do not invent success or initiate another refund.
+      }
+    }
+    return res.status(200).json({ success: true, bookingId, refundStatus: status,
+      refundAmountPaise: amountPaise, refundPercentage: refund?.refundPercentage ?? booking.refundPercentage ?? 0,
+      message: cancellationStatusMessage(status),
+    });
+  } catch (error) {
+    console.error("Refund status check failed:", error.message);
+    return res.status(500).json({ success: false, message: "Unable to verify refund status. Contact support." });
   }
 });
 
