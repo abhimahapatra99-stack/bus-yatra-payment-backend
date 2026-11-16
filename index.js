@@ -126,6 +126,28 @@ function parseDate(value) {
 function journeyKeyFor(busId, dateString, isReturnTrip) {
   return `${busId}_${dateString}${isReturnTrip ? "_return" : ""}`;
 }
+// Trip Schedule v1: one explicitly published trip per bus, service date, and direction.
+// Existing services remain in legacy mode until the operator deliberately sets
+// TRIP_SCHEDULE_ENFORCED=true on Render after publishing operating dates.
+function tripScheduleEnforced() {
+  return process.env.TRIP_SCHEDULE_ENFORCED === "true";
+}
+function isPublishedTrip(data) {
+  return data && data.serviceStatus === "scheduled";
+}
+function serviceDateString(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = parseDate(value);
+  if (!parsed) return null;
+  // Calendar dates like 2026-02-31 must not silently roll over.
+  const iso = new Date(parsed.getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return iso === value ? value : null;
+}
+function isValidBusId(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 150
+    && !value.includes("/");
+}
+
 function publicSeatRef(journeyKey, seatId) {
   return db.collection("journeys").doc(journeyKey).collection("seat_status").doc(seatId);
 }
@@ -328,7 +350,7 @@ async function requireFirebaseUser(req, res, next) {
   }
 }
 
-app.get("/", (_req, res) => res.json({ success: true, message: "Bus Yatra Payment Backend is running", firebaseConfigured: Boolean(db && auth), razorpayConfigured: Boolean(razorpay), ticketVerificationConfigured: Boolean(process.env.TICKET_VERIFY_SECRET && process.env.TICKET_VERIFY_SECRET.length >= 32) }));
+app.get("/", (_req, res) => res.json({ success: true, message: "Bus Yatra Payment Backend is running", firebaseConfigured: Boolean(db && auth), razorpayConfigured: Boolean(razorpay), ticketVerificationConfigured: Boolean(process.env.TICKET_VERIFY_SECRET && process.env.TICKET_VERIFY_SECRET.length >= 32), tripScheduleEnforced: tripScheduleEnforced() }));
 
 // ---------------------------------------------------------------------------
 // BUS YATRA VERIFIED E-TICKET - read-only endpoints.
@@ -471,6 +493,97 @@ app.get("/razorpay-key", (_req, res) => {
   return res.json({ success: true, keyId: process.env.RAZORPAY_KEY_ID });
 });
 
+// Published schedules for the customer search results. Does not expose personal data.
+app.get("/trip-schedules", async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    if (!db) return res.status(503).json({ success: false, message: "Schedule service unavailable." });
+    const date = serviceDateString(req.query.date);
+    if (!date) return res.status(400).json({ success: false, message: "Date must be YYYY-MM-DD." });
+    const snap = await db.collection("journeys").where("scheduleDate", "==", date).limit(1000).get();
+    if (snap.size === 1000) return res.status(503).json({ success: false,
+      message: "Schedule list is too large for a safe complete result. Contact support." });
+    const publishedKeys = snap.docs.filter(d => isPublishedTrip(d.data())).map(d => d.id);
+    return res.json({ success: true, enforced: tripScheduleEnforced(), publishedKeys });
+  } catch (error) {
+    console.error("Schedule list failed:", error.message);
+    return res.status(503).json({ success: false, message: "Could not check bus schedules." });
+  }
+});
+
+// Per-trip availability: used by the admin planner and for debugging.
+app.get("/trip-schedule-status", async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    if (!db) return res.status(503).json({ success: false, message: "Schedule service unavailable." });
+    const busId = cleanString(req.query.busId, 150);
+    const date = serviceDateString(req.query.date);
+    const isReturnTrip = req.query.isReturnTrip === "true";
+    if (!isValidBusId(busId) || !date) return res.status(400).json({ success: false, message: "Invalid bus/date." });
+    const snap = await db.collection("journeys").doc(journeyKeyFor(busId, date, isReturnTrip)).get();
+    const data = snap.exists ? snap.data() : {};
+    return res.json({ success: true, enforced: tripScheduleEnforced(),
+      status: data.serviceStatus || "not_scheduled", salesStarted: data.salesStarted === true,
+      date, isReturnTrip });
+  } catch (error) {
+    console.error("Trip status failed:", error.message);
+    return res.status(503).json({ success: false, message: "Could not read trip schedule." });
+  }
+});
+
+// Only a Firestore-confirmed admin can publish dates or mark dates as not running.
+// One document per journey; booking/order transactions read/write the same doc.
+app.post("/admin/trip-schedule", requireFirebaseUser, async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, message: "Database unavailable." });
+    const admin = await db.collection("users").doc(req.firebaseUser.uid).get();
+    if (!admin.exists || String(admin.data().role || "").toLowerCase() !== "admin") {
+      return res.status(403).json({ success: false, message: "Admin access required." });
+    }
+    const busId = cleanString(req.body?.busId, 150);
+    const date = serviceDateString(req.body?.date);
+    const isReturnTrip = req.body?.isReturnTrip === true;
+    const status = cleanString(req.body?.status, 30);
+    if (!isValidBusId(busId) || !date || !["scheduled", "not_running"].includes(status)) {
+      return res.status(400).json({ success: false, message: "Invalid bus, date or status." });
+    }
+    const todayIndia = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+    if (date < todayIndia) return res.status(400).json({ success: false, message: "Past service dates cannot be edited." });
+    const busSnap = await db.collection("buses").doc(busId).get();
+    if (!busSnap.exists) return res.status(404).json({ success: false, message: "Bus not found." });
+    const bus = busSnap.data();
+    if (status === "scheduled" && bookingClosed(bus, parseDate(date), isReturnTrip)) {
+      return res.status(409).json({ success: false, message: "Departure has passed or booking is closed; cannot publish this trip." });
+    }
+    if (isReturnTrip && !cleanString(bus.returnDepartureTime, 40)) {
+      return res.status(409).json({ success: false, message: "Return-trip departure time is not configured." });
+    }
+    const key = journeyKeyFor(busId, date, isReturnTrip);
+    const tripRef = db.collection("journeys").doc(key);
+    // Legacy booked/held seats may exist before schedule rollout. Do not cancel
+    // a service with those reservations: a separate trip-cancellation/refund flow is required.
+    if (status !== "scheduled") {
+      const seatDocs = await tripRef.collection("seats").where("status", "in", ["booked", "pendingPayment", "femaleOnly"]).limit(1).get();
+      if (!seatDocs.empty) return res.status(409).json({ success: false, message: "This trip has existing seats/reservations. Do not mark No Service; use a managed trip-cancellation process." });
+    }
+    await db.runTransaction(async tx => {
+      const snap = await tx.get(tripRef);
+      if (status !== "scheduled" && snap.exists && snap.data().salesStarted === true) {
+        throw new Error("Sales have already started for this trip. Contact support to cancel an existing service safely.");
+      }
+      tx.set(tripRef, {
+        busId, scheduleDate: date, isReturnTrip, serviceStatus: status,
+        scheduleUpdatedBy: req.firebaseUser.uid, scheduleUpdatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+    });
+    return res.json({ success: true, journeyKey: key, status,
+      message: status === "scheduled" ? "Trip published for this date." : "No service recorded for this date." });
+  } catch (error) {
+    console.error("Admin trip schedule failed:", error.message);
+    return res.status(409).json({ success: false, message: error.message || "Could not update trip." });
+  }
+});
+
 // Create an authenticated order. Amount is calculated from Firestore, never trusted from Flutter.
 app.post("/create-order", requireFirebaseUser, async (req, res) => {
   let reservationCreated = false;
@@ -508,7 +621,15 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     let totalRupees = 0;
     const busSeatsRef = busRef.collection("seats");
     const journeyKey = journeyKeyFor(busId, journeyDateString, isReturnTrip);
-    const journeySeatsRef = db.collection("journeys").doc(journeyKey).collection("seats");
+    const tripScheduleRef = db.collection("journeys").doc(journeyKey);
+    if (tripScheduleEnforced()) {
+      const tripSnap = await tripScheduleRef.get();
+      if (!tripSnap.exists || !isPublishedTrip(tripSnap.data())) {
+        return res.status(409).json({ success: false,
+          message: "This bus is not scheduled on the selected date. Please select another date." });
+      }
+    }
+    const journeySeatsRef = tripScheduleRef.collection("seats");
     const seatSnapshots = await Promise.all(selectedSeats.map((id) => busSeatsRef.doc(id).get()));
     const journeySnapshots = await Promise.all(selectedSeats.map((id) => journeySeatsRef.doc(id).get()));
     const pairIds = new Set();
@@ -550,6 +671,10 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     await db.runTransaction(async (tx) => {
       const existingBooking = await tx.get(bookingRef);
       if (existingBooking.exists) throw new Error("This booking ID has already been used. Please retry checkout.");
+      const tripScheduleSnap = await tx.get(tripScheduleRef);
+      if (tripScheduleEnforced() && (!tripScheduleSnap.exists || !isPublishedTrip(tripScheduleSnap.data()))) {
+        throw new Error("No bus service is published for this date. Payment has not started.");
+      }
       const selectedSnaps = {};
       const pairSnaps = {};
       for (const id of selectedSeats) {
@@ -597,6 +722,9 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
           updatedAt: FieldValue.serverTimestamp(),
         }, { merge: true });
       }
+      // A sale was initiated; prevents an admin from silently unpublishing
+      // this trip while its payment is in flight or after it has been sold.
+      tx.set(tripScheduleRef, { salesStarted: true, lastSaleAttemptAt: FieldValue.serverTimestamp() }, { merge: true });
     });
     reservationCreated = true;
 
@@ -629,6 +757,7 @@ await db.collection("razorpay_orders").doc(order.id).set({
   journeyDate: journeyDateString,
   journeyKey,
   isReturnTrip,
+  scheduleRequiredAtOrder: tripScheduleEnforced(),
   passengerName,
   mobile,
   email: cleanString(req.firebaseUser.email || body.email, 200),
@@ -963,6 +1092,13 @@ async function verifyCapturedPaymentAndBook(req, res, reconciliation = false) {
       const bus = busSnap.data();
       if (bookingClosed(bus, date, savedOrder.isReturnTrip === true)) {
         throw new Error("Bus departure has passed or booking has closed.");
+      }
+      const scheduleSnap = await tx.get(db.collection("journeys").doc(savedOrder.journeyKey));
+      // Honor orders created while the operator was still in legacy setup mode;
+      // otherwise enabling enforcement mid-checkout could strand captured funds.
+      const orderRequiresSchedule = savedOrder.scheduleRequiredAtOrder === true;
+      if (orderRequiresSchedule && (!scheduleSnap.exists || !isPublishedTrip(scheduleSnap.data()))) {
+        throw new Error("Payment captured, but no published trip exists for this date. Manual refund/review required.");
       }
 
       const selectedBusSnaps = {};
