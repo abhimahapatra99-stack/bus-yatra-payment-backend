@@ -1480,6 +1480,8 @@ app.post("/refund-status", requireFirebaseUser, async (req, res) => {
         const recordedPaymentId = cleanString(refund?.paymentId || booking.razorpayPaymentId || booking.paymentId, 120);
         const gatewayAmount = Number(gateway?.amount);
         // Do not accept data from a different payment or an unexpected refund amount.
+        // Only mirror gateway details when refund ID, payment and amount match.
+        let verifiedGatewayDetails = null;
         if (gateway?.id !== refundId || (recordedPaymentId && gatewayPaymentId !== recordedPaymentId)
             || !Number.isFinite(gatewayAmount) || gatewayAmount !== amountPaise) {
           status = "needs_review";
@@ -1488,9 +1490,21 @@ app.post("/refund-status", requireFirebaseUser, async (req, res) => {
           status = gatewayStatus === "processed" ? "successful"
             : gatewayStatus === "failed" ? "failed"
             : ["pending", "created"].includes(gatewayStatus) ? "processing" : "needs_review";
+          verifiedGatewayDetails = {
+            gatewayStatus: gatewayStatus || "unknown",
+            gatewayResponse: {
+              id: gateway.id,
+              status: gatewayStatus || "unknown",
+              amount: gatewayAmount,
+            },
+          };
         }
         if (refund) {
-          await refundRef.set({ status, checkedAt: FieldValue.serverTimestamp() }, { merge: true });
+          await refundRef.set({
+            status,
+            ...(verifiedGatewayDetails || {}),
+            checkedAt: FieldValue.serverTimestamp(),
+          }, { merge: true });
         }
         await bookingRef.set({ refundStatus: status }, { merge: true });
       } catch (error) {
