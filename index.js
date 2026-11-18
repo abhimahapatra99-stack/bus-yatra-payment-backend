@@ -584,6 +584,128 @@ app.post("/admin/trip-schedule", requireFirebaseUser, async (req, res) => {
   }
 });
 
+// One-action admin date-range scheduler: daily and alternating directions.
+// Each requested range is atomic; a conflicting existing booking or hold
+// prevents ALL changes in the range. No recurring cron job or blind overwrite.
+function generateTripSchedulePlan({ busId, startDate, days, mode, hasReturn }) {
+  const supported = ["daily_outward", "daily_return", "daily_both",
+    "alternate_outward_first", "alternate_return_first"];
+  if (!supported.includes(mode)) throw new Error("Select a supported schedule pattern.");
+  if (!Number.isInteger(days) || days < 1 || days > 30) {
+    throw new Error("Select 1 to 30 days per batch.");
+  }
+  if (!hasReturn && mode !== "daily_outward") {
+    throw new Error("Return departure time must be configured first.");
+  }
+  const result = [];
+  const start = parseDate(startDate);
+  for (let offset = 0; offset < days; offset++) {
+    const day = new Date(start.getTime() + offset * 86400000);
+    const yyyy = new Date(day.getTime() + 19800000).toISOString().slice(0, 10);
+    const outboundOn = mode === "daily_outward" || mode === "daily_both" ||
+      (mode === "alternate_outward_first" && offset % 2 === 0) ||
+      (mode === "alternate_return_first" && offset % 2 === 1);
+    const returnOn = mode === "daily_return" || mode === "daily_both" ||
+      (mode === "alternate_return_first" && offset % 2 === 0) ||
+      (mode === "alternate_outward_first" && offset % 2 === 1);
+    result.push({ busId, date: yyyy, isReturnTrip: false,
+      status: outboundOn ? "scheduled" : "not_running",
+      key: journeyKeyFor(busId, yyyy, false) });
+    if (hasReturn) result.push({ busId, date: yyyy, isReturnTrip: true,
+      status: returnOn ? "scheduled" : "not_running",
+      key: journeyKeyFor(busId, yyyy, true) });
+  }
+  return result;
+}
+
+app.post("/admin/trip-schedules/bulk", requireFirebaseUser, async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, message: "Schedule service unavailable." });
+    const admin = await db.collection("users").doc(req.firebaseUser.uid).get();
+    if (!admin.exists || String(admin.data().role || "").toLowerCase() !== "admin") {
+      return res.status(403).json({ success: false, message: "Admin access required." });
+    }
+    const busId = cleanString(req.body?.busId, 150);
+    const startDate = serviceDateString(req.body?.startDate);
+    const days = Number(req.body?.days);
+    const mode = cleanString(req.body?.mode, 50);
+    const previewOnly = req.body?.previewOnly === true;
+    if (!isValidBusId(busId) || !startDate || !Number.isInteger(days) || days < 1 || days > 30) {
+      return res.status(400).json({ success: false, message: "Invalid bus/date/days. Limit: 30 days." });
+    }
+    const todayIndia = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(new Date());
+    const lastDate = new Date(parseDate(startDate).getTime() + (days - 1) * 86400000);
+    const endDate = new Date(lastDate.getTime() + 19800000).toISOString().slice(0, 10);
+    const yearLimit = new Date(parseDate(todayIndia).getTime() + 365 * 86400000);
+    if (startDate < todayIndia || lastDate.getTime() > yearLimit.getTime()) {
+      return res.status(400).json({ success: false, message: "Choose dates from today up to one year ahead." });
+    }
+    const busRef = db.collection("buses").doc(busId);
+    const busSnap = await busRef.get();
+    if (!busSnap.exists) return res.status(404).json({ success: false, message: "Bus not found." });
+    const bus = busSnap.data();
+    const hasReturn = Boolean(cleanString(bus.returnDepartureTime, 40));
+    const plan = generateTripSchedulePlan({busId, startDate, days, mode, hasReturn});
+    for (const item of plan) {
+      if (item.status === "scheduled" && bookingClosed(bus, parseDate(item.date), item.isReturnTrip)) {
+        return res.status(409).json({ success: false,
+          message: `Cannot publish ${item.date} ${item.isReturnTrip ? "return" : "outward"}: bus booking has closed.` });
+      }
+    }
+    // Read all relevant journey parents and active reservations inside one
+    // transaction before writing anything. Serializes with online checkout
+    // transactions, and rejects legacy seat bookings with no salesStarted field.
+    const existing = await db.runTransaction(async tx => {
+      const state = [];
+      for (const item of plan) {
+        const ref = db.collection("journeys").doc(item.key);
+        const parent = await tx.get(ref);
+        let activeSeatCount = 0;
+        if (item.status === "not_running") {
+          const occupied = await tx.get(ref.collection("seats")
+            .where("status", "in", ["booked", "pendingPayment", "femaleOnly"])
+            .limit(1));
+          activeSeatCount = occupied.size;
+          if (activeSeatCount === 0) {
+            // Legacy public-only records must not be silently overwritten.
+            const publicHeld = await tx.get(ref.collection("seat_status")
+              .where("status", "in", ["booked", "pendingPayment", "femaleOnly"])
+              .limit(1));
+            activeSeatCount = publicHeld.size;
+          }
+        }
+        const wasSold = parent.exists && parent.data()?.salesStarted === true;
+        if (item.status === "not_running" && (wasSold || activeSeatCount > 0)) {
+          throw new Error(`Existing seat sales/holds on ${item.date} (${item.isReturnTrip ? "return" : "outward"}). No dates changed. Use the managed cancellation process.`);
+        }
+        state.push({item, ref, old: parent.exists ? (parent.data().serviceStatus || "not_scheduled") : "not_scheduled"});
+      }
+      if (!previewOnly) {
+        for (const {item, ref} of state) {
+          tx.set(ref, {
+            busId, scheduleDate: item.date, isReturnTrip: item.isReturnTrip,
+            serviceStatus: item.status, scheduleUpdatedBy: req.firebaseUser.uid,
+            scheduleUpdatedAt: FieldValue.serverTimestamp(),
+          }, {merge: true});
+        }
+      }
+      return state.map(({item, old}) => ({date:item.date,
+        isReturnTrip:item.isReturnTrip, status:item.status, previousStatus:old}));
+    });
+    return res.json({success: true, previewOnly, mode, startDate, endDate, days,
+      tripCount: plan.length, entries: existing,
+      enforced: tripScheduleEnforced(), message: previewOnly
+        ? "Preview verified. No schedule changes saved."
+        : "Schedule dates saved atomically. Keep enforcement OFF until all buses are ready."});
+  } catch (error) {
+    console.error("Bulk schedule failed:", error.message);
+    return res.status(409).json({success: false,
+      message: error.message || "Schedule could not be updated. No partial batch saved."});
+  }
+});
+
 // Create an authenticated order. Amount is calculated from Firestore, never trusted from Flutter.
 app.post("/create-order", requireFirebaseUser, async (req, res) => {
   let reservationCreated = false;
