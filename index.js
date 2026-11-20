@@ -3,6 +3,8 @@ const cors = require("cors");
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const fs = require("fs");
+const { validateDirection: validateRouteTimingDraft, previewBoarding: previewDraftBoarding } = require("./route_timing_review");
+const { overnightBookingEnabled, validLocalServiceDate, resolveApprovedBoarding, boardingAtIsClosed } = require("./overnight_booking_core");
 const { evaluate: evaluateTimetableApproval, fingerprint: timetableFingerprint, approvalRecord } = require("./timetable_approval_v2");
 
 const { initializeApp, getApps, cert } = require("firebase-admin/app");
@@ -122,7 +124,7 @@ function cleanString(value, max = 200) {
 function parseDate(value) {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
   const date = new Date(`${value}T00:00:00+05:30`);
-  return Number.isNaN(date.getTime()) ? null : date;
+  return Number.isNaN(date.getTime()) || !validLocalServiceDate(value) ? null : date;
 }
 function journeyKeyFor(busId, dateString, isReturnTrip) {
   return `${busId}_${dateString}${isReturnTrip ? "_return" : ""}`;
@@ -161,6 +163,59 @@ function routeStopsFor(bus) {
   return from && to ? [from, to] : [];
 }
 function normalizeStop(s) { return String(s ?? "").trim().toLowerCase(); }
+
+// BUS YATRA ROUTE-AND-BOARDING SAFETY (V2 preparation).
+// These helpers must use the SAME bus stop order that routeFareFor uses.
+// A fare alone never authorizes a requested Going/Return direction.
+function canonicalRouteDirection(bus, from, to) {
+  const stops = routeStopsFor(bus);
+  const normalized = stops.map(normalizeStop);
+  if (normalized.length < 2 || normalized.some((s) => !s) ||
+      new Set(normalized).size !== normalized.length) return null;
+  const fromIndex = normalized.indexOf(normalizeStop(from));
+  const toIndex = normalized.indexOf(normalizeStop(to));
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return null;
+  return {
+    fromIndex, toIndex,
+    isReturnTrip: fromIndex > toIndex,
+    boardingStop: stops[fromIndex],
+    droppingStop: stops[toIndex],
+  };
+}
+
+// Calendar-day arithmetic only. Using UTC noon here avoids timezone/DST
+// rollover when computing a SERVICE DATE from a NEXT-DAY boarding date.
+// This helper is not yet connected to live bookings (draft timings only).
+function boardingToServiceDate(boardingDate, dayOffset) {
+  if (!serviceDateString(boardingDate) || !Number.isInteger(dayOffset) ||
+      dayOffset < 0 || dayOffset > 2) return null;
+  const utc = new Date(`${boardingDate}T12:00:00Z`);
+  utc.setUTCDate(utc.getUTCDate() - dayOffset);
+  return utc.toISOString().slice(0, 10);
+}
+
+// Validate draft rows without turning them on for customers. Admin must
+// approve exact Going AND Return stop schedules before activation.
+function previewDraftBoardingDate(bus, from, to, boardingDate) {
+  const segment = canonicalRouteDirection(bus, from, to);
+  if (!segment) return null;
+  const draft = bus.routeTimingDraftV2;
+  if (!draft || draft.schemaVersion !== 2 || draft.timezone !== "Asia/Kolkata") return null;
+  const going = !segment.isReturnTrip;
+  const expectedStops = routeStopsFor(bus);
+  if (!going) expectedStops.reverse();
+  const rows = going ? draft.going : draft.return;
+  if (!Array.isArray(rows) || rows.length !== expectedStops.length ||
+      rows.some((row, index) => !row ||
+        normalizeStop(row.stop) !== normalizeStop(expectedStops[index]))) return null;
+  const row = rows.find((r) => normalizeStop(r.stop) === normalizeStop(from));
+  const offset = row?.departureDayOffset;
+  if (!Number.isInteger(offset)) return null;
+  const serviceDate = boardingToServiceDate(boardingDate, offset);
+  if (!serviceDate) return null;
+  return { ...segment, boardingDate, serviceDate, dayOffset: offset };
+}
+// END ROUTE-AND-BOARDING SAFETY.
 function routeFareFor(bus, from, to, sleeper) {
   const stops = routeStopsFor(bus);
   const start = stops.findIndex((s) => normalizeStop(s) === normalizeStop(from));
@@ -261,10 +316,18 @@ function bookingClosed(bus, date, isReturnTrip = false) {
 }
 
 
+// New overnight orders store an immutable server-validated boarding timestamp.
+// Legacy bookings retain their existing service-origin cutoff behavior.
+function bookingClosedForPassenger(bus, journeyDate, isReturnTrip, boardingAt) {
+  if (boardingAt) return boardingAtIsClosed(bus, boardingAt);
+  return bookingClosed(bus, journeyDate, isReturnTrip);
+}
+
+
 // Cancellation refund policy (India local journey time): >24h = 90%, >6h to 24h = 50%, <=6h = 0%.
 function cancellationDeparture(bus, booking, date) {
   const isReturn = booking.isReturnTrip === true;
-  const direct = booking.departureDateTime || booking.departureAt;
+  const direct = booking.boardingAt || booking.departureDateTime || booking.departureAt;
   if (direct && typeof direct.toDate === "function") return direct.toDate();
   if (direct) { const d = new Date(direct); if (Number.isFinite(d.getTime())) return d; }
   const timeValue = isReturn
@@ -437,7 +500,9 @@ app.post("/ticket-package", requireFirebaseUser, async (req, res) => {
         bookingId,
         busName: String(b.busName || ""), busType: String(b.busType || ""),
         from: String(b.from || ""), to: String(b.to || ""),
-        date: ticketDate(b),
+        // Passenger-visible ticket must show the day they ACTUALLY board.
+        date: String(b.boardingDate || ticketDate(b)),
+        serviceDate: ticketDate(b),
         departureTime: String(b.departureTime || ""), arrivalTime: String(b.arrivalTime || ""),
         passengerName: String(b.passengerName || ""),
         gender: String(b.gender || ""),
@@ -476,7 +541,9 @@ app.get("/ticket-verify", async (req, res) => {
       ["Booking ID", id],
       ["Bus", b.busName],
       ["Route", `${b.from || ""} to ${b.to || ""}`],
-      ["Journey", ticketDate(b)],
+      ["Boarding date", String(b.boardingDate || ticketDate(b))],
+      ...(b.boardingDate && b.boardingDate !== ticketDate(b)
+        ? [["Original trip date", ticketDate(b)]] : []),
       ["Seats", Array.isArray(b.selectedSeats) ? b.selectedSeats.join(", ") : "N/A"],
       ["Booking", String(b.status || "unknown").toUpperCase()],
       ["Payment", String(b.paymentStatus || "unknown").toUpperCase()],
@@ -495,6 +562,24 @@ app.get("/razorpay-key", (_req, res) => {
 });
 
 // Published schedules for the customer search results. Does not expose personal data.
+// Phase 8-12 prelaunch read-only release status. No secrets or user data.
+// Feature gates must remain OFF until controlled integration tests pass.
+app.get("/release-status", (_req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  return res.json({
+    success: true,
+    release: "phase8-12-prelaunch-rc1",
+    firebaseConfigured: Boolean(db && auth),
+    razorpayConfigured: Boolean(razorpay),
+    ticketVerificationConfigured: Boolean(process.env.TICKET_VERIFY_SECRET && process.env.TICKET_VERIFY_SECRET.length >= 32),
+    timetableApprovalEnabled: process.env.TIMETABLE_APPROVAL_ENABLED === "true",
+    overnightBookingEnabled: overnightBookingEnabled(),
+    tripScheduleEnforced: tripScheduleEnforced(),
+    productionAcceptanceTestsPassed: false,
+    message: "Read-only status. No payment, booking, Firestore or approval action was performed."
+  });
+});
+
 app.get("/trip-schedules", async (req, res) => {
   res.set("Cache-Control", "no-store, max-age=0");
   try {
@@ -505,7 +590,8 @@ app.get("/trip-schedules", async (req, res) => {
     if (snap.size === 1000) return res.status(503).json({ success: false,
       message: "Schedule list is too large for a safe complete result. Contact support." });
     const publishedKeys = snap.docs.filter(d => isPublishedTrip(d.data())).map(d => d.id);
-    return res.json({ success: true, enforced: tripScheduleEnforced(), publishedKeys });
+    return res.json({ success: true, enforced: tripScheduleEnforced(),
+      overnightBookingEnabled: overnightBookingEnabled(), publishedKeys });
   } catch (error) {
     console.error("Schedule list failed:", error.message);
     return res.status(503).json({ success: false, message: "Could not check bus schedules." });
@@ -532,6 +618,81 @@ app.get("/trip-schedule-status", async (req, res) => {
   }
 });
 
+// Phase 3 read-only customer preflight; no draft timetables or booking changes.
+// OFF by default. Only approved (routeTimingLiveV2) data can be returned.
+app.get("/boarding-trip-resolution", async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    if (!overnightBookingEnabled()) return res.status(409).json({ success: false, enabled: false,
+      message: "Overnight boarding is not yet enabled." });
+    if (!db) return res.status(503).json({ success: false, message: "Database unavailable." });
+    const busId = cleanString(req.query.busId, 150);
+    const from = cleanString(req.query.from, 100);
+    const to = cleanString(req.query.to, 100);
+    const boardingDate = cleanString(req.query.boardingDate, 10);
+    if (!isValidBusId(busId) || !from || !to || !validLocalServiceDate(boardingDate)) {
+      return res.status(400).json({ success: false, message: "Invalid bus, route or boarding date." });
+    }
+    const busSnap = await db.collection("buses").doc(busId).get();
+    if (!busSnap.exists) return res.status(404).json({ success: false, message: "Bus not found." });
+    const preview = resolveApprovedBoarding(busSnap.data(), busId, from, to, boardingDate);
+    if (!preview.ok) return res.status(409).json({ success: false, message: preview.error });
+    const trip = await db.collection("journeys").doc(preview.journeyKey).get();
+    if (!trip.exists || !isPublishedTrip(trip.data())) {
+      return res.status(409).json({ success: false,
+        message: "No published bus journey for the original service date." });
+    }
+    if (boardingAtIsClosed(busSnap.data(), preview.boardingAt)) {
+      return res.status(409).json({ success: false, message: "Boarding has closed for this stop." });
+    }
+    return res.json({ success: true, ...preview });
+  } catch (error) {
+    console.error("Boarding resolution failed:", error.message);
+    return res.status(503).json({ success: false, message: "Boarding trip could not be verified." });
+  }
+});
+
+// Phase 2 read-only preflight. Does NOT activate draft times or modify seats,
+// bookings, schedules, payments or Firestore documents.
+app.post("/admin/boarding-date-review", requireFirebaseUser, async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    if (!db) return res.status(503).json({ success: false, message: "Database unavailable." });
+    const admin = await db.collection("users").doc(req.firebaseUser.uid).get();
+    if (!admin.exists || String(admin.data().role || "").toLowerCase() !== "admin") {
+      return res.status(403).json({ success: false, message: "Admin access required." });
+    }
+    const { busId: rawBusId, from: rawFrom, to: rawTo, boardingDate: rawDate } = req.body || {};
+    const busId = cleanString(rawBusId, 150);
+    const from = cleanString(rawFrom, 100);
+    const to = cleanString(rawTo, 100);
+    const boardingDate = serviceDateString(rawDate);
+    if (!isValidBusId(busId) || !from || !to || !boardingDate) {
+      return res.status(400).json({ success: false, message: "Bus, both stops and valid boarding date required." });
+    }
+    const busSnap = await db.collection("buses").doc(busId).get();
+    if (!busSnap.exists) return res.status(404).json({ success: false, message: "Bus not found." });
+    const bus = busSnap.data();
+    const goingReview = validateRouteTimingDraft(bus, false);
+    const returnReview = validateRouteTimingDraft(bus, true);
+    const preview = previewDraftBoarding(bus, busId, from, to, boardingDate);
+    if (!preview.ok) {
+      return res.status(409).json({ success: false, message: preview.error,
+        goingDraftValid: goingReview.ok, returnDraftValid: returnReview.ok,
+        liveBookingActivated: false });
+    }
+    const tripSnap = await db.collection("journeys").doc(preview.journeyKey).get();
+    const status = tripSnap.exists ? tripSnap.data()?.serviceStatus || "not_scheduled" : "not_scheduled";
+    return res.status(200).json({ success: true, preview, tripServiceStatus: status,
+      tripScheduleEnforced: tripScheduleEnforced(), goingDraftValid: goingReview.ok,
+      returnDraftValid: returnReview.ok, liveBookingActivated: false,
+      note: "Review only. Payment and counter bookings still use existing service-date behavior." });
+  } catch (error) {
+    console.error("Boarding-date review failed:", error.message);
+    return res.status(503).json({ success: false, message: "Could not verify boarding-date preview." });
+  }
+});
+
 // Phase 8: default-OFF, admin-only first approval. This cannot activate bookings.
 // Preview never writes. Commit rechecks all inputs INSIDE one transaction.
 app.post("/admin/timetable-approval-v2", requireFirebaseUser, async (req, res) => {
@@ -551,7 +712,7 @@ app.post("/admin/timetable-approval-v2", requireFirebaseUser, async (req, res) =
       return res.status(400).json({success:false,message:"Choose bus, valid Going/Return dates and preview/approve action."});
     }
     if (commit && (process.env.TIMETABLE_APPROVAL_ENABLED !== 'true' ||
-        process.env.OVERNIGHT_BOOKING_ENABLED === 'true' || tripScheduleEnforced())) {
+        overnightBookingEnabled() || tripScheduleEnforced())) {
       return res.status(409).json({success:false,message:"Approval is locked. Backend approval gate must be explicitly ON and both booking feature flags OFF."});
     }
     const busRef=db.collection('buses').doc(busId);
@@ -600,8 +761,6 @@ app.post("/admin/timetable-approval-v2", requireFirebaseUser, async (req, res) =
     return res.status(503).json({success:false,message:'Approval could not complete. No confirmation issued.'});
   }
 });
-
-
 
 // Only a Firestore-confirmed admin can publish dates or mark dates as not running.
 // One document per journey; booking/order transactions read/write the same doc.
@@ -792,6 +951,7 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     const from = cleanString(body.from, 100); const to = cleanString(body.to, 100);
     const journeyDateString = cleanString(body.journeyDate, 10);
     const journeyDate = parseDate(journeyDateString);
+    const boardingDateString = cleanString(body.boardingDate, 10);
     const isReturnTrip = body.isReturnTrip === true;
     const gender = cleanString(body.gender, 20).toLowerCase();
     const passengerName = cleanString(body.passengerName, 150);
@@ -805,7 +965,33 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     const busSnap = await busRef.get();
     if (!busSnap.exists) return res.status(400).json({ success: false, message: "Selected bus was not found." });
     const bus = busSnap.data();
-    if (bookingClosed(bus, journeyDate, isReturnTrip)) {
+    // Never trust isReturnTrip supplied by the browser. Derive its true value
+    // from the immutable ordered stop sequence on the bus document.
+    const route = canonicalRouteDirection(bus, from, to);
+    if (!route || route.isReturnTrip !== isReturnTrip) {
+      return res.status(400).json({ success: false,
+        message: "Invalid route direction for the selected bus. Please search again." });
+    }
+    // Phase 3 opt-in: the backend derives the ORIGINAL trip date from an
+    // APPROVED stop timetable, never trusting the customer's journey date.
+    // Draft timings cannot authorize bookings; the global flag is OFF by default.
+    let boardingContext = null;
+    if (overnightBookingEnabled()) {
+      if (!boardingDateString || !validLocalServiceDate(boardingDateString)) {
+        return res.status(409).json({ success: false,
+          message: "Update the app and select your actual boarding date before booking." });
+      }
+      boardingContext = resolveApprovedBoarding(bus, busId, from, to, boardingDateString);
+      if (!boardingContext.ok || boardingContext.isReturnTrip !== isReturnTrip ||
+          boardingContext.serviceDate !== journeyDateString) {
+        return res.status(409).json({ success: false,
+          message: "Boarding stop/date does not match the original bus journey. Please search again." });
+      }
+    } else if (body.boardingDate && body.boardingDate !== journeyDateString) {
+      return res.status(409).json({ success: false,
+        message: "Boarding date differs from the journey date. Please update the app before booking this stop." });
+    }
+    if (bookingClosedForPassenger(bus, journeyDate, isReturnTrip, boardingContext?.boardingAt)) {
   return res.status(409).json({
     success: false,
     message: "Booking is closed for this bus or it has already departed."
@@ -816,7 +1002,7 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     const busSeatsRef = busRef.collection("seats");
     const journeyKey = journeyKeyFor(busId, journeyDateString, isReturnTrip);
     const tripScheduleRef = db.collection("journeys").doc(journeyKey);
-    if (tripScheduleEnforced()) {
+    if (tripScheduleEnforced() || boardingContext) {
       const tripSnap = await tripScheduleRef.get();
       if (!tripSnap.exists || !isPublishedTrip(tripSnap.data())) {
         return res.status(409).json({ success: false,
@@ -866,7 +1052,7 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
       const existingBooking = await tx.get(bookingRef);
       if (existingBooking.exists) throw new Error("This booking ID has already been used. Please retry checkout.");
       const tripScheduleSnap = await tx.get(tripScheduleRef);
-      if (tripScheduleEnforced() && (!tripScheduleSnap.exists || !isPublishedTrip(tripScheduleSnap.data()))) {
+      if ((tripScheduleEnforced() || boardingContext) && (!tripScheduleSnap.exists || !isPublishedTrip(tripScheduleSnap.data()))) {
         throw new Error("No bus service is published for this date. Payment has not started.");
       }
       const selectedSnaps = {};
@@ -951,7 +1137,13 @@ await db.collection("razorpay_orders").doc(order.id).set({
   journeyDate: journeyDateString,
   journeyKey,
   isReturnTrip,
-  scheduleRequiredAtOrder: tripScheduleEnforced(),
+  scheduleRequiredAtOrder: tripScheduleEnforced() || Boolean(boardingContext),
+  // Immutable boarding metadata from validated approved stop timings.
+  ...(boardingContext ? {
+    boardingDate: boardingContext.boardingDate, boardingAt: boardingContext.boardingAt,
+    dropoffDate: boardingContext.dropoffDate, dropoffAt: boardingContext.dropoffAt,
+    timetableSchemaVersion: 2,
+  } : {}),
   passengerName,
   mobile,
   email: cleanString(req.firebaseUser.email || body.email, 200),
@@ -962,8 +1154,10 @@ await db.collection("razorpay_orders").doc(order.id).set({
   protectedSeatIds,
   total: totalRupees,
   busType: cleanString(bus.busType, 100),
-  departureTime: cleanString(bus.departureTime, 50),
-  arrivalTime: cleanString(bus.arrivalTime, 50),
+  departureTime: boardingContext
+    ? boardingContext.boardingTime : cleanString(bus.departureTime, 50),
+  arrivalTime: boardingContext
+    ? boardingContext.dropoffTime : cleanString(bus.arrivalTime, 50),
 
   holdExpiresAt,
 
@@ -1284,7 +1478,7 @@ async function verifyCapturedPaymentAndBook(req, res, reconciliation = false) {
       }
 
       const bus = busSnap.data();
-      if (bookingClosed(bus, date, savedOrder.isReturnTrip === true)) {
+      if (bookingClosedForPassenger(bus, date, savedOrder.isReturnTrip === true, savedOrder.boardingAt)) {
         throw new Error("Bus departure has passed or booking has closed.");
       }
       const scheduleSnap = await tx.get(db.collection("journeys").doc(savedOrder.journeyKey));
@@ -1394,6 +1588,12 @@ async function verifyCapturedPaymentAndBook(req, res, reconciliation = false) {
         arrivalTime: savedOrder.arrivalTime,
         journeyDate: bookingDate,
         journeyDateString: savedOrder.journeyDate,
+        // Used for ticket boarding day, cancellation refund and departure cutoff.
+        ...(savedOrder.boardingAt ? {
+          boardingDate: savedOrder.boardingDate, boardingAt: savedOrder.boardingAt,
+          dropoffDate: savedOrder.dropoffDate, dropoffAt: savedOrder.dropoffAt,
+          timetableSchemaVersion: savedOrder.timetableSchemaVersion,
+        } : {}),
         createdAt: FieldValue.serverTimestamp(),
       });
 
@@ -1624,7 +1824,7 @@ app.post("/cancellation-quote", requireFirebaseUser, async (req, res) => {
     }
     const busSnap = await db.collection("buses").doc(busId).get();
     const bus = busSnap.exists ? busSnap.data() : {};
-    if (!isAdmin && bookingClosed(bus, date, booking.isReturnTrip === true)) {
+    if (!isAdmin && bookingClosedForPassenger(bus, date, booking.isReturnTrip === true, booking.boardingAt)) {
       return res.status(403).json({ success: false, message: "Cancellation is closed for this journey." });
     }
     const quote = cancellationQuoteFor(booking, bus, date);
@@ -1695,7 +1895,7 @@ app.post("/cancel-booking", requireFirebaseUser, async (req, res) => {
         refundStatus, refundAmountPaise, refundPercentage } = quote;
 
       // Preserve the app's existing rule: customers cannot cancel after departure; admin may override.
-      if (!isAdmin && bookingClosed(bus, date, booking.isReturnTrip === true)) throw new Error("Cancellation is closed because the bus has departed or booking is manually closed.");
+      if (!isAdmin && bookingClosedForPassenger(bus, date, booking.isReturnTrip === true, booking.boardingAt)) throw new Error("Cancellation is closed because the bus has departed or booking is manually closed.");
 
       tx.update(bookingRef, {
         status: "cancelled", cancelledAt: FieldValue.serverTimestamp(),
