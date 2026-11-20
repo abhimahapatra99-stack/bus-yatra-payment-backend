@@ -3,6 +3,7 @@ const cors = require("cors");
 const Razorpay = require("razorpay");
 const crypto = require("crypto");
 const fs = require("fs");
+const { evaluate: evaluateTimetableApproval, fingerprint: timetableFingerprint, approvalRecord } = require("./timetable_approval_v2");
 
 const { initializeApp, getApps, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
@@ -530,6 +531,77 @@ app.get("/trip-schedule-status", async (req, res) => {
     return res.status(503).json({ success: false, message: "Could not read trip schedule." });
   }
 });
+
+// Phase 8: default-OFF, admin-only first approval. This cannot activate bookings.
+// Preview never writes. Commit rechecks all inputs INSIDE one transaction.
+app.post("/admin/timetable-approval-v2", requireFirebaseUser, async (req, res) => {
+  res.set("Cache-Control", "no-store, max-age=0");
+  try {
+    if (!db) return res.status(503).json({success:false, message:"Firestore backend unavailable."});
+    const admin = await db.collection("users").doc(req.firebaseUser.uid).get();
+    if (!admin.exists || String(admin.data()?.role || "").toLowerCase() !== "admin") {
+      return res.status(403).json({success:false, message:"Admin access required."});
+    }
+    const body=req.body || {};
+    const busId=cleanString(body.busId,150);
+    const dates={going:body.goingDate,return:body.returnDate};
+    const commit=body.action === 'approve';
+    if (!['preview','approve'].includes(body.action) || !isValidBusId(busId) ||
+        !validLocalServiceDate(dates.going) || !validLocalServiceDate(dates.return)) {
+      return res.status(400).json({success:false,message:"Choose bus, valid Going/Return dates and preview/approve action."});
+    }
+    if (commit && (process.env.TIMETABLE_APPROVAL_ENABLED !== 'true' ||
+        process.env.OVERNIGHT_BOOKING_ENABLED === 'true' || tripScheduleEnforced())) {
+      return res.status(409).json({success:false,message:"Approval is locked. Backend approval gate must be explicitly ON and both booking feature flags OFF."});
+    }
+    const busRef=db.collection('buses').doc(busId);
+    const goingRef=db.collection('journeys').doc(journeyKeyFor(busId,dates.going,false));
+    const returnRef=db.collection('journeys').doc(journeyKeyFor(busId,dates.return,true));
+    const readState=async getter => {
+      const busSnap=await getter(busRef);
+      if (!busSnap.exists) return null;
+      const seatSnap=await getter(busRef.collection('seats'));
+      const goingSnap=await getter(goingRef);
+      const returnSnap=await getter(returnRef);
+      const seats=seatSnap.docs.map(d=>({id:d.id,...d.data()}));
+      const journeys={going:goingSnap.exists?goingSnap.data():null,
+        return:returnSnap.exists?returnSnap.data():null};
+      const bus=busSnap.data();
+      const check=evaluateTimetableApproval({bus,busId,seatDocs:seats,journeys,dates});
+      return {bus,check,token:timetableFingerprint({bus,seats,journeys,dates})};
+    };
+    if (!commit) {
+      const state=await readState(ref=>ref.get());
+      if (!state) return res.status(404).json({success:false,message:"Bus not found."});
+      return res.json({success:true,approvalReady:state.check.ok,
+        ...state.check,reviewToken:state.token,approvalGateEnabled:process.env.TIMETABLE_APPROVAL_ENABLED === 'true',
+        activated:false,readOnly:true});
+    }
+    const token=typeof body.reviewToken === 'string' ? body.reviewToken : '';
+    if (!/^[a-f0-9]{64}$/.test(token) || body.confirmText !== 'APPROVE TIMETABLE') {
+      return res.status(400).json({success:false,message:"A fresh preview and exact approval confirmation are required."});
+    }
+    const outcome=await db.runTransaction(async tx=>{
+      const state=await readState(ref=>tx.get(ref));
+      if (!state) return {error:'Bus not found.'};
+      if (!state.check.ok) return {error:'Approval blocked: '+state.check.blockers.join('; ')};
+      if (state.token !== token) return {error:'Saved draft, fares, seats or published sample journeys changed. Preview again.'};
+      // Single atomic bus document write; no journey, booking, seat or payment changes.
+      tx.update(busRef, {routeTimingLiveV2:{...approvalRecord(state.bus,req.firebaseUser.uid),
+        approvedAt:FieldValue.serverTimestamp(),
+        sampleGoingDate:dates.going,sampleReturnDate:dates.return}});
+      return {success:true,approved:true};
+    });
+    if (outcome.error) return res.status(409).json({success:false,message:outcome.error});
+    return res.json({...outcome,overnightBookingActivated:false,
+      tripScheduleActivated:false,message:'Timetable approved; booking feature flags remain OFF.'});
+  } catch(error) {
+    console.error('Timetable Phase 8 approval failed:',error.message);
+    return res.status(503).json({success:false,message:'Approval could not complete. No confirmation issued.'});
+  }
+});
+
+
 
 // Only a Firestore-confirmed admin can publish dates or mark dates as not running.
 // One document per journey; booking/order transactions read/write the same doc.
