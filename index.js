@@ -1043,7 +1043,7 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
         if (!["booked", "blocked"].includes(pairStatus) && !(pairStatus === "pendingpayment" && holdIsActive(pair)) && !((pairStatus === "femaleonly" || pair.femaleOnly === true) && !isExpiredTemporaryHold(pair))) protectedSeatIds.push(pairId);
       }
     }
-    const holdExpiresAt = Timestamp.fromDate(new Date(Date.now() + 10 * 60 * 1000));
+    const holdExpiresAt = Timestamp.fromDate(new Date(Date.now() + 15 * 60 * 1000));
     const bookingRef = db.collection("bookings").doc(bookingId);
     reservationContext = { bookingId, userId: req.firebaseUser.uid, journeyKey, selectedSeats, protectedSeatIds };
 
@@ -1109,7 +1109,7 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
     reservationCreated = true;
 
 // Razorpay Orders API has no documented expire_by parameter.
-// The 10-minute seat hold is enforced by Firestore during verification.
+// The 15-minute seat hold is enforced by Firestore during verification.
 // Important: an order may still be paid after that hold expires;
 // such a captured payment goes to manual reconciliation, never an unverified booking.
 const order = await razorpay.orders.create({
